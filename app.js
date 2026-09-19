@@ -30,13 +30,14 @@ async function loadFoods() {
   FOODS = CNF.concat(USDA);
   if (!FOODS.length) toast('Food database failed to load — check your connection');
 }
-// ---------- Storage (this device only) ----------
+// ---------- Storage: local cache + Firebase cloud sync ----------
+const FIREBASE_CONFIG = { apiKey: 'AIzaSyDcRdTEzGJa6YfFgesaefw90mHZZrTvaQo', authDomain: 'plate-ledger-8007d.firebaseapp.com', projectId: 'plate-ledger-8007d', storageBucket: 'plate-ledger-8007d.firebasestorage.app', messagingSenderId: '697214158009', appId: '1:697214158009:web:1189551d41ae8640e9c768' };
 const store = {
-  mode: 'local',
   lsGet(k) { try { const v = localStorage.getItem('pl:' + k); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
   lsSet(k, v) { try { localStorage.setItem('pl:' + k, JSON.stringify(v)); return true; } catch (e) { toast('Could not save — storage is full or blocked'); return false; } },
+  lsDel(k) { try { localStorage.removeItem('pl:' + k); } catch (e) {} },
   async get(path) { return this.lsGet(path); },
-  async set(path, data) { return this.lsSet(path, data); },
+  async set(path, data) { const ok = this.lsSet(path, data); cloud.push(path, data); return ok; },
   async recentDays(n) {
     const out = [];
     try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/')) out.push(JSON.parse(localStorage.getItem(k))); } } catch (e) {}
@@ -44,6 +45,79 @@ const store = {
   },
   allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:') && k !== 'pl:tab') ks.push(k); } } catch (e) {} return ks; }
 };
+// Cloud layer. Paths map to Firestore: days/<date> -> users/<uid>/days/<date>; anything else -> users/<uid>/meta/<path with / replaced by _>
+const cloud = {
+  ready: false, user: null, db: null, auth: null, status: 'off', lastSync: null, unsub: [], listeners: [],
+  onChange(fn) { this.listeners.push(fn); },
+  emit() { for (const fn of this.listeners) { try { fn(); } catch (e) {} } },
+  init() {
+    if (!window.firebase) { this.status = 'unavailable'; return; }
+    try {
+      firebase.initializeApp(FIREBASE_CONFIG);
+      this.auth = firebase.auth(); this.db = firebase.firestore();
+      try { this.db.settings({ ignoreUndefinedProperties: true }); } catch (e) {}
+      try { this.db.enablePersistence({ synchronizeTabs: true }).catch(() => {}); } catch (e) {}
+      this.ready = true; this.status = 'signedout';
+      this.auth.onAuthStateChanged(u => { this.user = u || null; if (u) this.start(); else this.stop(); this.emit(); });
+      try { this.auth.getRedirectResult().catch(() => {}); } catch (e) {}
+    } catch (e) { console.warn('firebase init failed', e); this.status = 'unavailable'; }
+  },
+  ref(path) {
+    const base = this.db.collection('users').doc(this.user.uid);
+    if (path.startsWith('days/')) return base.collection('days').doc(path.slice(5));
+    return base.collection('meta').doc(path.replace(/\//g, '_'));
+  },
+  push(path, data) {
+    if (!this.user || !this.db) return;
+    this.status = 'syncing'; this.emit();
+    this.ref(path).set(JSON.parse(JSON.stringify(data))).then(() => { this.status = 'synced'; this.lastSync = Date.now(); this.emit(); })
+      .catch(e => { console.warn('cloud push failed', e); this.status = 'error'; this.error = e.code || e.message; this.emit(); });
+  },
+  async start() {
+    // 1) pull everything from the cloud; 2) upload anything only on this device; 3) listen for changes from other devices
+    this.status = 'syncing'; this.emit();
+    try {
+      const base = this.db.collection('users').doc(this.user.uid);
+      const [daysSnap, metaSnap] = await Promise.all([base.collection('days').get(), base.collection('meta').get()]);
+      const cloudKeys = new Set();
+      daysSnap.forEach(d => { cloudKeys.add('days/' + d.id); store.lsSet('days/' + d.id, d.data()); });
+      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : null; if (k) { cloudKeys.add(k); store.lsSet(k, d.data()); } });
+      // upload local-only records (first sign-in on a device that already has a diary)
+      const batch = this.db.batch(); let n = 0;
+      for (const k of store.allKeys()) { const path = k.slice(3); if (!cloudKeys.has(path)) { const v = store.lsGet(path); if (v && typeof v === 'object') { batch.set(this.ref(path), JSON.parse(JSON.stringify(v))); n++; } } }
+      if (n) await batch.commit();
+      this.status = 'synced'; this.lastSync = Date.now();
+      // live listeners
+      this.stopListeners();
+      this.unsub.push(base.collection('days').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; if (c.type === 'removed') store.lsDel('days/' + c.doc.id); else store.lsSet('days/' + c.doc.id, c.doc.data()); delete S.days[c.doc.id]; changed = true; }); if (changed) { this.lastSync = Date.now(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
+      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : null; if (!k) return; store.lsSet(k, c.doc.data()); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
+    } catch (e) { console.warn('cloud sync failed', e); this.status = 'error'; this.error = e.code || e.message; }
+    reloadStateFromLocal(); S.days = {}; this.emit(); refreshView();
+  },
+  stopListeners() { for (const u of this.unsub) { try { u(); } catch (e) {} } this.unsub = []; },
+  stop() { this.stopListeners(); this.status = this.ready ? 'signedout' : 'unavailable'; },
+  async signIn() {
+    if (!this.ready) { toast('Cloud sync is not available right now'); return; }
+    const provider = new firebase.auth.GoogleAuthProvider();
+    try { await this.auth.signInWithPopup(provider); }
+    catch (e) {
+      if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment' || e.code === 'auth/cancelled-popup-request') { try { await this.auth.signInWithRedirect(provider); } catch (e2) { toast('Sign-in failed: ' + (e2.code || e2.message)); } }
+      else if (e.code !== 'auth/popup-closed-by-user') toast('Sign-in failed: ' + (e.code || e.message));
+    }
+  },
+  async signOut() {
+    if (!this.ready) return;
+    await this.auth.signOut();
+    for (const k of store.allKeys()) { try { localStorage.removeItem(k); } catch (e) {} }
+    location.reload();
+  }
+};
+function reloadStateFromLocal() {
+  const st = store.lsGet('settings/main'); S.settings = st ? { ...DEFAULTS, ...st } : { ...DEFAULTS };
+  const cf = store.lsGet('foods/custom'); S.custom = (cf && cf.items) || []; for (const f of S.custom) f.lc = f.name.toLowerCase();
+  const rc = store.lsGet('foods/recent'); S.recent = (rc && rc.items) || [];
+}
+function refreshView() { if (document.querySelector('#sheetRoot').children.length) return; ({ today: renderToday, trends: renderTrends, foods: renderFoods, settings: renderSettings })[S.tab || 'today'](); }
 // ---------- State ----------
 const DEFAULTS = { kcal: 2200, p: 150, c: 230, f: 75, fib: 30, sug: 50, na: 2300, meals: ['Breakfast', 'Lunch', 'Dinner', 'Snacks'], netMode: false };
 const S = { settings: { ...DEFAULTS }, date: todayStr(), days: {}, custom: [], recent: [], tab: 'today', lastWeight: null };
@@ -124,6 +198,9 @@ async function renderToday() {
       el('div', { class: 'mini' }, el('b', {}, r0(t.fib) + ' / ' + st.fib + ' g'), 'Fibre'),
       el('div', { class: 'mini' }, el('b', {}, r0(t.sug) + ' / ' + st.sug + ' g'), 'Sugar'),
       el('div', { class: 'mini' }, el('b', {}, r0(t.na) + ' / ' + st.na + ' mg'), 'Sodium')));
+  if (cloud.ready && !cloud.user) root.append(el('div', { class: 'card', style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
+    el('div', { style: 'flex:1;min-width:200px' }, el('strong', {}, 'Not backed up yet'), el('div', { class: 'hint' }, 'Sign in with Google to keep your diary safe and use it on any device.')),
+    el('button', { class: 'btn', style: 'flex:0 0 auto', onclick: () => cloud.signIn() }, 'Sign in with Google')));
   root.append(sum);
   for (const meal of st.meals) {
     const es = day.entries.filter(e => e.meal === meal); const mk = es.reduce((a, e) => a + e.kcal, 0);
@@ -437,6 +514,7 @@ function renderSettings() {
   const save = async () => { await store.set('settings/main', st); };
   const mk = (k, label, unit) => { const i = el('input', { id: 's_' + k, type: 'number', inputmode: 'numeric', value: st[k] }); i.addEventListener('change', async () => { st[k] = parseFloat(i.value) || DEFAULTS[k]; await save(); toast('Targets saved'); }); return field(label + ' (' + unit + ')', i); };
   const net = el('input', { type: 'checkbox', id: 'net', checked: st.netMode ? '' : null }); net.addEventListener('change', async () => { st.netMode = net.checked; await save(); });
+  root.append(accountCard());
   root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Daily targets'),
     el('div', { class: 'row' }, mk('kcal', 'Calories', 'kcal'), mk('p', 'Protein', 'g')), el('div', { class: 'row' }, mk('c', 'Carbs', 'g'), mk('f', 'Fat', 'g')),
     el('div', { class: 'row' }, mk('fib', 'Fibre', 'g'), mk('sug', 'Sugar', 'g'), mk('na', 'Sodium', 'mg')),
@@ -455,10 +533,25 @@ function renderSettings() {
   const imp = el('input', { type: 'file', accept: 'application/json', hidden: '' });
   imp.onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const j = JSON.parse(await f.text()); let n = 0; for (const [k, v] of Object.entries(j)) if (k.startsWith('pl:')) { localStorage.setItem(k, JSON.stringify(v)); n++; } toast('Restored ' + n + ' records'); location.reload(); } catch (err) { toast('That file is not a Plate Ledger backup'); } };
   root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Data'),
-    el('div', { class: 'hint' }, 'Your diary lives in this browser on this device — nobody else can see it. Back it up now and then; clearing website data would erase it.'),
+    el('div', { class: 'hint' }, cloud.user ? 'Your diary is saved to your Google account (private to you) and cached on this device. Backups are optional now.' : 'Until you sign in, your diary lives only in this browser on this device — clearing website data would erase it.'),
     el('div', { class: 'row' }, el('button', { class: 'btn ghost', onclick: exportCsv }, 'Export CSV'), el('button', { class: 'btn ghost', onclick: exportBackup }, 'Backup (JSON)')),
     el('button', { class: 'btn ghost', onclick: () => imp.click() }, 'Restore from backup'), imp,
     el('div', { class: 'hint' }, `Food database: ${CNF.length.toLocaleString()} Canadian Nutrient File + ${USDA.length.toLocaleString()} USDA foods. Version ${APP_VERSION}.`)));
+}
+function accountCard() {
+  const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Cloud sync'));
+  if (!cloud.ready) { c.append(el('div', { class: 'hint' }, 'Cloud sync is not available in this view (offline or blocked). Your data is still saved on this device.')); return c; }
+  if (!cloud.user) {
+    c.append(el('div', { class: 'hint' }, 'Sign in with your Google account to keep your diary safe and synced across your phone and computer. Nobody else can see your data.'),
+      el('button', { class: 'btn', onclick: () => cloud.signIn() }, 'Sign in with Google'));
+  } else {
+    const st = el('div', { class: 'hint' });
+    const paint = () => { st.textContent = cloud.status === 'syncing' ? 'Syncing…' : cloud.status === 'error' ? 'Sync problem: ' + (cloud.error || 'unknown') + ' — data is still saved on this device.' : cloud.lastSync ? 'Synced ' + new Date(cloud.lastSync).toLocaleTimeString('en-CA', { hour: 'numeric', minute: '2-digit' }) : 'Synced'; };
+    paint(); cloud.onChange(paint);
+    c.append(el('div', {}, el('strong', {}, cloud.user.displayName || cloud.user.email), el('div', { class: 'hint' }, cloud.user.email)), st,
+      el('button', { class: 'btn ghost', onclick: () => { if (confirm('Sign out? Your diary stays safe in your Google account, but will be removed from this device until you sign in again.')) cloud.signOut(); } }, 'Sign out'));
+  }
+  return c;
 }
 function downloadText(filename, text, type) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = filename; document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
@@ -488,11 +581,10 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 (async () => {
-  const st = store.lsGet('settings/main'); if (st) S.settings = { ...DEFAULTS, ...st };
-  const cf = store.lsGet('foods/custom'); S.custom = (cf && cf.items) || []; for (const f of S.custom) f.lc = f.name.toLowerCase();
-  const rc = store.lsGet('foods/recent'); S.recent = (rc && rc.items) || [];
+  reloadStateFromLocal();
+  cloud.init();
   const recent = await store.recentDays(30); const lw = recent.find(d => d.weight); if (lw) S.lastWeight = lw.weight;
   let tab = 'today'; try { tab = localStorage.getItem('pl:tab') || 'today'; } catch (e) {}
   showTab(tab);
