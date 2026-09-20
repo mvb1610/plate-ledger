@@ -31,6 +31,9 @@ async function loadFoods() {
   if (!FOODS.length) toast('Food database failed to load — check your connection');
 }
 // ---------- Storage: local cache + Firebase cloud sync ----------
+const GOOGLE_CLIENT_ID = '697214158009-bbkc4g24jr4kjharq5da3i5t26b9nfng.apps.googleusercontent.com';
+const APP_URL = 'https://mvb1610.github.io/plate-ledger/';
+const isStandaloneApp = () => !!navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const FIREBASE_CONFIG = { apiKey: 'AIzaSyDcRdTEzGJa6YfFgesaefw90mHZZrTvaQo', authDomain: 'plate-ledger-8007d.firebaseapp.com', projectId: 'plate-ledger-8007d', storageBucket: 'plate-ledger-8007d.firebasestorage.app', messagingSenderId: '697214158009', appId: '1:697214158009:web:1189551d41ae8640e9c768' };
 const store = {
   lsGet(k) { try { const v = localStorage.getItem('pl:' + k); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
@@ -43,7 +46,7 @@ const store = {
     try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/')) out.push(JSON.parse(localStorage.getItem(k))); } } catch (e) {}
     return out.sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
   },
-  allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:') && k !== 'pl:tab') ks.push(k); } } catch (e) {} return ks; }
+  allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/') || k.startsWith('pl:settings/') || k.startsWith('pl:foods/')) ks.push(k); } } catch (e) {} return ks; }
 };
 // Cloud layer. Paths map to Firestore: days/<date> -> users/<uid>/days/<date>; anything else -> users/<uid>/meta/<path with / replaced by _>
 const cloud = {
@@ -59,7 +62,7 @@ const cloud = {
       try { this.db.enablePersistence({ synchronizeTabs: true }).catch(() => {}); } catch (e) {}
       this.ready = true; this.status = 'signedout';
       this.auth.onAuthStateChanged(u => { this.user = u || null; if (u) this.start(); else this.stop(); this.emit(); });
-      try { this.auth.getRedirectResult().catch(() => {}); } catch (e) {}
+      this.handleOAuthReturn().catch(() => {});
     } catch (e) { console.warn('firebase init failed', e); this.status = 'unavailable'; }
   },
   ref(path) {
@@ -98,12 +101,31 @@ const cloud = {
   stop() { this.stopListeners(); this.status = this.ready ? 'signedout' : 'unavailable'; },
   async signIn() {
     if (!this.ready) { toast('Cloud sync is not available right now'); return; }
+    // Installed iPhone/Android app: Safari blocks Firebase's popup and redirect flows, so go straight to Google and come back here.
+    if (isStandaloneApp()) { this.redirectToGoogle(); return; }
     const provider = new firebase.auth.GoogleAuthProvider();
     try { await this.auth.signInWithPopup(provider); }
     catch (e) {
-      if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment' || e.code === 'auth/cancelled-popup-request') { try { await this.auth.signInWithRedirect(provider); } catch (e2) { toast('Sign-in failed: ' + (e2.code || e2.message)); } }
-      else if (e.code !== 'auth/popup-closed-by-user') toast('Sign-in failed: ' + (e.code || e.message));
+      if (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request') return;
+      this.redirectToGoogle();
     }
+  },
+  redirectToGoogle() {
+    const state = uid(); try { localStorage.setItem('pl:oauth_state', state); } catch (e) {}
+    const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    u.searchParams.set('client_id', GOOGLE_CLIENT_ID); u.searchParams.set('redirect_uri', APP_URL); u.searchParams.set('response_type', 'token');
+    u.searchParams.set('scope', 'openid email profile'); u.searchParams.set('state', state); u.searchParams.set('prompt', 'select_account');
+    location.href = u.toString();
+  },
+  async handleOAuthReturn() {
+    if (!location.hash.includes('access_token=')) return false;
+    const p = new URLSearchParams(location.hash.slice(1)); const tok = p.get('access_token'); const st = p.get('state');
+    let saved = null; try { saved = localStorage.getItem('pl:oauth_state'); localStorage.removeItem('pl:oauth_state'); } catch (e) {}
+    history.replaceState(null, '', location.pathname + location.search);
+    if (!tok || (saved && st !== saved)) { toast('Sign-in could not be completed — try again'); return false; }
+    try { await this.auth.signInWithCredential(firebase.auth.GoogleAuthProvider.credential(null, tok)); toast('Signed in'); }
+    catch (e) { toast('Sign-in failed: ' + (e.code || e.message)); }
+    return true;
   },
   async signOut() {
     if (!this.ready) return;
@@ -581,7 +603,7 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 (async () => {
   reloadStateFromLocal();
   cloud.init();
