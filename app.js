@@ -48,6 +48,9 @@ const store = {
   },
   allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/') || k.startsWith('pl:settings/') || k.startsWith('pl:foods/')) ks.push(k); } } catch (e) {} return ks; }
 };
+// Firestore rejects nested arrays (e.g. servings [['1 cup', 158]]), so inner arrays are wrapped as {__a: [...]} on the way up and unwrapped on the way down.
+const fsEnc = v => Array.isArray(v) ? v.map(x => Array.isArray(x) ? { __a: fsEnc(x) } : fsEnc(x)) : (v && typeof v === 'object') ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => [k, fsEnc(x)])) : v;
+const fsDec = v => Array.isArray(v) ? v.map(fsDec) : (v && typeof v === 'object') ? ('__a' in v && Object.keys(v).length === 1 ? fsDec(v.__a) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fsDec(x)]))) : v;
 // Cloud layer. Paths map to Firestore: days/<date> -> users/<uid>/days/<date>; anything else -> users/<uid>/meta/<path with / replaced by _>
 const cloud = {
   ready: false, user: null, db: null, auth: null, status: 'off', lastSync: null, unsub: [], listeners: [],
@@ -73,7 +76,7 @@ const cloud = {
   push(path, data) {
     if (!this.user || !this.db) return;
     this.status = 'syncing'; this.emit();
-    this.ref(path).set(JSON.parse(JSON.stringify(data))).then(() => { this.status = 'synced'; this.lastSync = Date.now(); this.emit(); })
+    this.ref(path).set(fsEnc(JSON.parse(JSON.stringify(data)))).then(() => { this.status = 'synced'; this.lastSync = Date.now(); this.emit(); })
       .catch(e => { console.warn('cloud push failed', e); this.status = 'error'; this.error = e.code || e.message; this.emit(); });
   },
   async start() {
@@ -83,17 +86,17 @@ const cloud = {
       const base = this.db.collection('users').doc(this.user.uid);
       const [daysSnap, metaSnap] = await Promise.all([base.collection('days').get(), base.collection('meta').get()]);
       const cloudKeys = new Set();
-      daysSnap.forEach(d => { cloudKeys.add('days/' + d.id); store.lsSet('days/' + d.id, d.data()); });
-      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : d.id === 'foods_meals' ? 'foods/meals' : null; if (k) { cloudKeys.add(k); store.lsSet(k, d.data()); } });
+      daysSnap.forEach(d => { cloudKeys.add('days/' + d.id); store.lsSet('days/' + d.id, fsDec(d.data())); });
+      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : d.id === 'foods_meals' ? 'foods/meals' : null; if (k) { cloudKeys.add(k); store.lsSet(k, fsDec(d.data())); } });
       // upload local-only records (first sign-in on a device that already has a diary)
-      const batch = this.db.batch(); let n = 0;
-      for (const k of store.allKeys()) { const path = k.slice(3); if (!cloudKeys.has(path)) { const v = store.lsGet(path); if (v && typeof v === 'object') { batch.set(this.ref(path), JSON.parse(JSON.stringify(v))); n++; } } }
-      if (n) await batch.commit();
+      const ups = [];
+      for (const k of store.allKeys()) { const path = k.slice(3); if (!cloudKeys.has(path)) { const v = store.lsGet(path); if (v && typeof v === 'object') ups.push(this.ref(path).set(fsEnc(JSON.parse(JSON.stringify(v)))).catch(e => console.warn('upload failed', path, e))); } }
+      if (ups.length) await Promise.all(ups);
       this.status = 'synced'; this.lastSync = Date.now();
       // live listeners
       this.stopListeners();
-      this.unsub.push(base.collection('days').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; if (c.type === 'removed') store.lsDel('days/' + c.doc.id); else store.lsSet('days/' + c.doc.id, c.doc.data()); delete S.days[c.doc.id]; changed = true; }); if (changed) { this.lastSync = Date.now(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
-      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : c.doc.id === 'foods_meals' ? 'foods/meals' : null; if (!k) return; store.lsSet(k, c.doc.data()); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
+      this.unsub.push(base.collection('days').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; if (c.type === 'removed') store.lsDel('days/' + c.doc.id); else store.lsSet('days/' + c.doc.id, fsDec(c.doc.data())); delete S.days[c.doc.id]; changed = true; }); if (changed) { this.lastSync = Date.now(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
+      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : c.doc.id === 'foods_meals' ? 'foods/meals' : null; if (!k) return; store.lsSet(k, fsDec(c.doc.data())); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
     } catch (e) { console.warn('cloud sync failed', e); this.status = 'error'; this.error = e.code || e.message; }
     reloadStateFromLocal(); S.days = {}; this.emit(); refreshView();
   },
@@ -812,7 +815,7 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 (async () => {
   reloadStateFromLocal();
   cloud.init();
