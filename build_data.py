@@ -10,6 +10,13 @@ import csv, io, json, os, urllib.request, zipfile
 OUT = 'data'
 os.makedirs(OUT, exist_ok=True)
 WANT = {'208': 'kcal', '203': 'p', '205': 'c', '204': 'f', '291': 'fib', '269': 'sug', '307': 'na'}
+# Micronutrients (USDA legacy nutrient numbers; CNF uses the same codes). Stored as index 11: [ca, fe, k, mg, zn, vd, b12, vc, fol]
+MICRO = {'301': 'ca', '303': 'fe', '306': 'k', '304': 'mg', '309': 'zn', '328': 'vd', '418': 'b12', '401': 'vc', '417': 'fol'}
+MICRO_ORDER = ['ca', 'fe', 'k', 'mg', 'zn', 'vd', 'b12', 'vc', 'fol']
+MICRO_DEC = {'ca': 0, 'fe': 2, 'k': 0, 'mg': 0, 'zn': 2, 'vd': 2, 'b12': 2, 'vc': 1, 'fol': 0}
+def micro_row(n):
+    if not any(k in n for k in MICRO_ORDER): return []
+    return [round(n.get(k, 0), MICRO_DEC[k]) for k in MICRO_ORDER]
 
 
 def fetch(url):
@@ -29,8 +36,25 @@ def build_cnf():
     names = {os.path.basename(n).lower(): n for n in z.namelist()}
     rd = lambda fn: rows_csv(z.read(names[fn.lower()]))
     groups = {r['CNF_Food_Group_Code']: r['CNF_Food_Group_Description_EN'] for r in rd('CNF_Food_Group.csv')}
+    micro_codes = dict(MICRO); vd_iu = set()
+    try:  # CNF nutrient codes match USDA for these, but resolve by name to be safe and note vitamin D units
+        for r in rd('Nutrient_Name.csv'):
+            nm = (r.get('Nutrient_Name') or r.get('Nutrient_Name_EN') or '').upper(); code = r['Nutrient_Code']; unit = (r.get('Nutrient_Unit') or '').lower()
+            for key, pat in [('ca', 'CALCIUM'), ('fe', 'IRON'), ('k', 'POTASSIUM'), ('mg', 'MAGNESIUM'), ('zn', 'ZINC'), ('b12', 'VITAMIN B-12'), ('vc', 'VITAMIN C'), ('fol', 'FOLATE, TOTAL')]:
+                if nm.startswith(pat) and code not in micro_codes: micro_codes[code] = key
+            if nm.startswith('VITAMIN D') and ('D2' in nm or 'D3' in nm or unit in ('\u00b5g', 'ug', 'mcg')) and code not in micro_codes: micro_codes[code] = 'vd'
+            if micro_codes.get(code) == 'vd' and unit == 'iu': vd_iu.add(code)
+    except Exception as e:
+        print('nutrient name lookup skipped:', e)
     nut = {}
     for r in rd('Nutrient_Amount.csv'):
+        mk = micro_codes.get(r['Nutrient_Code'])
+        if mk:
+            try:
+                v = float(r['Nutrient_Amount'])
+                if r['Nutrient_Code'] in vd_iu: v = v / 40.0
+                nut.setdefault(r['Food_Code'], {}).setdefault(mk, v)
+            except ValueError: pass
         k = WANT.get(r['Nutrient_Code'])
         if k:
             try: nut.setdefault(r['Food_Code'], {})[k] = float(r['Nutrient_Amount'])
@@ -51,7 +75,7 @@ def build_cnf():
         n = nut.get(fid, {})
         if 'kcal' not in n: continue
         g = lambda k: round(n.get(k, 0), 1)
-        out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4]])
+        out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4], micro_row(n)])
     json.dump({'groups': groups, 'foods': out}, open(f'{OUT}/cnf.json', 'w'), separators=(',', ':'), ensure_ascii=False)
     print('CNF foods:', len(out))
 
@@ -72,6 +96,8 @@ def build_usda():
     for r in rows(nut_txt):
         if r[1] in WANT:
             nut.setdefault(r[0], {})[WANT[r[1]]] = float(r[2])
+        elif r[1] in MICRO:
+            nut.setdefault(r[0], {})[MICRO[r[1]]] = float(r[2])
     wt = {}
     for r in rows(fetch(base + 'WEIGHT.txt')):
         fid, amt, desc, g = r[0], float(r[2]), r[3], float(r[4])
@@ -85,7 +111,7 @@ def build_usda():
         n = nut.get(fid, {})
         if 'kcal' not in n: continue
         g = lambda k: round(n.get(k, 0), 1)
-        out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4]])
+        out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4], micro_row(n)])
     json.dump({'groups': groups, 'foods': out}, open(f'{OUT}/usda.json', 'w'), separators=(',', ':'))
     print('USDA foods:', len(out))
 
