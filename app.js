@@ -21,8 +21,9 @@ const fmtDate = s => { const t = todayStr(); if (s === t) return 'Today'; if (s 
 
 // ---------- Food database (loaded from data/*.json) ----------
 let FOODS = [], CNF = [], USDA = [];
+const MKEYS = ['ca', 'fe', 'k', 'mg', 'zn', 'vd', 'b12', 'vc', 'fol'];
 const SRC_LABEL = { cnf: 'CNF', usda: 'USDA', custom: 'My food' };
-const parseDb = (d, prefix, src) => d.foods.map(a => ({ id: prefix + a[0], name: a[1], group: d.groups[a[2]] || '', kcal: a[3], p: a[4], c: a[5], f: a[6], fib: a[7], sug: a[8], na: a[9], servings: a[10], per: 100, src, lc: a[1].toLowerCase() }));
+const parseDb = (d, prefix, src) => d.foods.map(a => ({ id: prefix + a[0], name: a[1], group: d.groups[a[2]] || '', kcal: a[3], p: a[4], c: a[5], f: a[6], fib: a[7], sug: a[8], na: a[9], servings: a[10], per: 100, src, lc: a[1].toLowerCase(), m: a[11] && a[11].length ? Object.fromEntries(MKEYS.map((k, i) => [k, a[11][i] || 0])) : undefined }));
 async function loadFoods() {
   const get = async f => { try { const r = await fetch(f); return r.ok ? await r.json() : null; } catch (e) { return null; } };
   const [c, u] = await Promise.all([get('data/cnf.json'), get('data/usda.json')]);
@@ -46,7 +47,7 @@ const store = {
     try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/')) out.push(JSON.parse(localStorage.getItem(k))); } } catch (e) {}
     return out.sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
   },
-  allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/') || k.startsWith('pl:settings/') || k.startsWith('pl:foods/')) ks.push(k); } } catch (e) {} return ks; }
+  allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/') || k.startsWith('pl:settings/') || k.startsWith('pl:foods/') || k.startsWith('pl:coach/')) ks.push(k); } } catch (e) {} return ks; }
 };
 // Firestore rejects nested arrays (e.g. servings [['1 cup', 158]]), so inner arrays are wrapped as {__a: [...]} on the way up and unwrapped on the way down.
 const fsEnc = v => Array.isArray(v) ? v.map(x => Array.isArray(x) ? { __a: fsEnc(x) } : fsEnc(x)) : (v && typeof v === 'object') ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => [k, fsEnc(x)])) : v;
@@ -87,7 +88,7 @@ const cloud = {
       const [daysSnap, metaSnap] = await Promise.all([base.collection('days').get(), base.collection('meta').get()]);
       const cloudKeys = new Set();
       daysSnap.forEach(d => { cloudKeys.add('days/' + d.id); store.lsSet('days/' + d.id, fsDec(d.data())); });
-      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : d.id === 'foods_meals' ? 'foods/meals' : null; if (k) { cloudKeys.add(k); store.lsSet(k, fsDec(d.data())); } });
+      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : d.id === 'foods_meals' ? 'foods/meals' : d.id === 'coach_last' ? 'coach/last' : null; if (k) { cloudKeys.add(k); store.lsSet(k, fsDec(d.data())); } });
       // upload local-only records (first sign-in on a device that already has a diary)
       const ups = [];
       for (const k of store.allKeys()) { const path = k.slice(3); if (!cloudKeys.has(path)) { const v = store.lsGet(path); if (v && typeof v === 'object') ups.push(this.ref(path).set(fsEnc(JSON.parse(JSON.stringify(v)))).catch(e => console.warn('upload failed', path, e))); } }
@@ -96,7 +97,7 @@ const cloud = {
       // live listeners
       this.stopListeners();
       this.unsub.push(base.collection('days').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; if (c.type === 'removed') store.lsDel('days/' + c.doc.id); else store.lsSet('days/' + c.doc.id, fsDec(c.doc.data())); delete S.days[c.doc.id]; changed = true; }); if (changed) { this.lastSync = Date.now(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
-      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : c.doc.id === 'foods_meals' ? 'foods/meals' : null; if (!k) return; store.lsSet(k, fsDec(c.doc.data())); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
+      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : c.doc.id === 'foods_meals' ? 'foods/meals' : c.doc.id === 'coach_last' ? 'coach/last' : null; if (!k) return; store.lsSet(k, fsDec(c.doc.data())); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
     } catch (e) { console.warn('cloud sync failed', e); this.status = 'error'; this.error = e.code || e.message; }
     reloadStateFromLocal(); S.days = {}; this.emit(); refreshView();
   },
@@ -175,7 +176,7 @@ function closeSheet() { if (openAdd.stop) { openAdd.stop(); openAdd.stop = null;
 const field = (label, input) => el('div', { class: 'field' }, el('label', { for: input.id }, label), input);
 
 // ---------- Nutrition helpers ----------
-const scaleFood = (food, grams) => { const k = grams / (food.per || 100); return { kcal: food.kcal * k, p: food.p * k, c: food.c * k, f: food.f * k, fib: food.fib * k, sug: food.sug * k, na: food.na * k }; };
+const scaleFood = (food, grams) => { const k = grams / (food.per || 100); const o = { kcal: food.kcal * k, p: food.p * k, c: food.c * k, f: food.f * k, fib: food.fib * k, sug: food.sug * k, na: food.na * k }; if (food.m) { o.m = {}; for (const key in food.m) o.m[key] = (food.m[key] || 0) * k; } return o; };
 const nutGrid = n => el('div', { class: 'nutgrid' },
   el('span', {}, el('b', {}, r1(n.p) + ' g'), 'Protein'), el('span', {}, el('b', {}, r1(n.c) + ' g'), 'Carbs'),
   el('span', {}, el('b', {}, r1(n.f) + ' g'), 'Fat'), el('span', {}, el('b', {}, r1(n.fib) + ' g'), 'Fibre'),
@@ -224,11 +225,13 @@ async function renderToday() {
     el('div', { class: 'minis' },
       el('div', { class: 'mini' }, el('b', {}, r0(t.fib) + ' / ' + st.fib + ' g'), 'Fibre'),
       el('div', { class: 'mini' }, el('b', {}, r0(t.sug) + ' / ' + st.sug + ' g'), 'Sugar'),
-      el('div', { class: 'mini' }, el('b', {}, r0(t.na) + ' / ' + st.na + ' mg'), 'Sodium')));
+      el('div', { class: 'mini' }, el('b', {}, r0(t.na) + ' / ' + st.na + ' mg'), 'Sodium')),
+    el('div', { class: 'chips', style: 'margin-top:10px' }, el('button', { class: 'chip', onclick: () => suggestMeal(guessMeal()) }, '✨ What should I eat?')));
   if (cloud.ready && !cloud.user) root.append(el('div', { class: 'card', style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
     el('div', { style: 'flex:1;min-width:200px' }, el('strong', {}, 'Not backed up yet'), el('div', { class: 'hint' }, 'Sign in with Google to keep your diary safe and use it on any device.')),
     el('button', { class: 'btn', style: 'flex:0 0 auto', onclick: () => cloud.signIn() }, 'Sign in with Google')));
   root.append(sum);
+  root.append(weekCard(await weekBudget(S.date)));
   for (const meal of st.meals) {
     const es = day.entries.filter(e => e.meal === meal); const mk = es.reduce((a, e) => a + e.kcal, 0);
     const card = el('div', { class: 'card meal' },
@@ -244,6 +247,7 @@ async function renderToday() {
       el('div', { class: 'k' }, r0(e.kcal))));
     root.append(card);
   }
+  root.append(nutrientsCard(day));
   // weight & exercise
   const wtr = weightTrend((await store.recentDays(60)).filter(d => d.weight).sort((a, b) => a.date.localeCompare(b.date)));
   const wx = el('div', { class: 'card stack' },
@@ -264,7 +268,9 @@ async function renderToday() {
 }
 
 // ---------- Add food sheet ----------
-function openAdd(meal, mode = 'search') {
+function guessMeal() { const h = new Date().getHours(); const ms = S.settings.meals; return ms[h < 10 ? 0 : h < 15 ? 1 : h < 21 ? 2 : Math.min(3, ms.length - 1)] || ms[0]; }
+function openAdd(meal, mode = 'search', prefill = null) {
+  openAdd.prefill = prefill;
   const seg = el('div', { class: 'seg' });
   const body = el('div', { class: 'stack' });
   const modes = [['search', 'Search'], ['scan', 'Scan'], ['meals', 'Meals'], ['photo', 'Photo'], ['describe', 'Describe'], ['custom', 'Quick add']];
@@ -381,7 +387,8 @@ function estimateView(meal, { withPhoto }) {
     go.disabled = true;
     wrap.append(drop);
   }
-  wrap.append(field(withPhoto ? 'Note (optional)' : 'What did you eat?', note), el('div', { class: 'row' }, go, stop), status, out);
+  if (openAdd.prefill) { note.value = openAdd.prefill; openAdd.prefill = null; }
+  wrap.append(field(withPhoto ? 'Note (optional)' : 'What did you eat?', note), withPhoto ? null : el('div', { class: 'chips' }, micButton(note)), el('div', { class: 'row' }, go, stop), status, out);
   async function run() {
     if (!withPhoto && !note.value.trim()) { note.focus(); return; }
     ctl = new AbortController(); go.disabled = true; stop.hidden = false; out.innerHTML = '';
@@ -529,12 +536,12 @@ function viewScan(meal) {
 
 // ---------- Saved meals & recipes ----------
 async function saveMeals() { await store.set('foods/meals', { items: S.meals.map(m => ({ ...m, items: m.items.map(i => ({ ...i, lc: undefined })) })) }); }
-const sumItems = items => items.reduce((t, e) => { for (const k of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na']) t[k] += e[k] || 0; t.grams += e.grams || 0; return t; }, { kcal: 0, p: 0, c: 0, f: 0, fib: 0, sug: 0, na: 0, grams: 0 });
+const sumItems = items => items.reduce((t, e) => { for (const k of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na']) t[k] += e[k] || 0; t.grams += e.grams || 0; if (e.m) { t.m = t.m || {}; for (const k in e.m) t.m[k] = (t.m[k] || 0) + (e.m[k] || 0); } return t; }, { kcal: 0, p: 0, c: 0, f: 0, fib: 0, sug: 0, na: 0, grams: 0 });
 function recipeFoods() {
   return S.meals.filter(m => m.type === 'recipe').map(m => { const t = sumItems(m.items); const sv = Math.max(1, m.servings || 1); const per = Math.round(t.grams / sv) || 100;
-    return { id: 'r' + m.id, name: m.name, per, kcal: t.kcal / sv, p: t.p / sv, c: t.c / sv, f: t.f / sv, fib: t.fib / sv, sug: t.sug / sv, na: t.na / sv, servings: [['serving', per]], src: 'recipe', lc: m.name.toLowerCase(), group: 'Recipe' }; });
+    return { id: 'r' + m.id, name: m.name, per, kcal: t.kcal / sv, p: t.p / sv, c: t.c / sv, f: t.f / sv, fib: t.fib / sv, sug: t.sug / sv, na: t.na / sv, m: t.m ? Object.fromEntries(Object.entries(t.m).map(([k, v]) => [k, v / sv])) : undefined, servings: [['serving', per]], src: 'recipe', lc: m.name.toLowerCase(), group: 'Recipe' }; });
 }
-const stripEntry = e => ({ name: e.name, foodId: e.foodId || null, qty: e.qty, unitLabel: e.unitLabel, grams: e.grams, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib || 0, sug: e.sug || 0, na: e.na || 0, src: e.src || 'usda' });
+const stripEntry = e => ({ name: e.name, foodId: e.foodId || null, qty: e.qty, unitLabel: e.unitLabel, grams: e.grams, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib || 0, sug: e.sug || 0, na: e.na || 0, src: e.src || 'usda', m: e.m || undefined });
 function saveMealFromEntries(meal, es) {
   const name = el('input', { id: 'mn', placeholder: 'e.g. Weekday breakfast', value: meal + ' · ' + fmtDate(S.date) });
   openSheet('Save as meal', el('div', { class: 'stack' }, el('div', { class: 'hint' }, `Saves these ${es.length} items so you can log them again with one tap (Add → Meals).`), field('Name', name)),
@@ -543,7 +550,7 @@ function saveMealFromEntries(meal, es) {
 }
 async function logSavedMeal(m, meal, mult) {
   const day = await loadDay(S.date); let k = 0;
-  for (const it of m.items) { const e = { ...it, id: uid(), meal, ts: Date.now() }; for (const key of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na', 'grams']) e[key] = (it[key] || 0) * mult; e.qty = it.qty ? it.qty * mult : e.grams; k += e.kcal; day.entries.push(e); }
+  for (const it of m.items) { const e = { ...it, id: uid(), meal, ts: Date.now() }; for (const key of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na', 'grams']) e[key] = (it[key] || 0) * mult; if (it.m) { e.m = {}; for (const key in it.m) e.m[key] = (it.m[key] || 0) * mult; } e.qty = it.qty ? it.qty * mult : e.grams; k += e.kcal; day.entries.push(e); }
   await saveDay(S.date); closeSheet(); renderToday(); toast('Logged ' + m.name + ' · ' + r0(k) + ' kcal');
 }
 function mealRow(m, onTap) {
@@ -662,6 +669,171 @@ function calculatorCard(st, save) {
     field('Activity', act), field('Goal', rate), field('Goal weight', goal), out, note, apply);
 }
 
+// ---------- Micronutrients ----------
+// key, label, unit, daily target [male, female] (Health Canada / IOM DRIs for adults)
+const MICROS = [['ca', 'Calcium', 'mg', [1000, 1000]], ['fe', 'Iron', 'mg', [8, 18]], ['k', 'Potassium', 'mg', [3400, 2600]], ['mg', 'Magnesium', 'mg', [420, 320]], ['zn', 'Zinc', 'mg', [11, 8]], ['vd', 'Vitamin D', 'µg', [20, 20]], ['b12', 'Vitamin B12', 'µg', [2.4, 2.4]], ['vc', 'Vitamin C', 'mg', [90, 75]], ['fol', 'Folate', 'µg', [400, 400]]];
+const microTarget = k => { const m = MICROS.find(x => x[0] === k); const f = (S.settings.profile || {}).sex === 'f'; return m ? m[3][f ? 1 : 0] : 0; };
+const microTotals = entries => { const t = {}; let known = 0; for (const e of entries) { if (e.m) { known++; for (const k in e.m) t[k] = (t[k] || 0) + (e.m[k] || 0); } } return { t, known, total: entries.length }; };
+const fmtMicro = (k, v) => k === 'ca' || k === 'k' || k === 'mg' || k === 'fol' ? r0(v) : Math.round(v * 10) / 10;
+function nutrientsCard(day) {
+  const { t, known, total } = microTotals(day.entries);
+  const open = (() => { try { return localStorage.getItem('pl:micro_open') === '1'; } catch (e) { return false; } })();
+  const body = el('div', { class: 'stack', hidden: open ? null : '' });
+  for (const [k, label, unit] of MICROS) { const tg = microTarget(k); const v = t[k] || 0; const pct = tg ? Math.min(v / tg, 1) * 100 : 0;
+    body.append(el('div', { class: 'macro' }, el('div', { class: 'lbl' }, el('span', {}, label), el('b', {}, fmtMicro(k, v) + ' / ' + tg + ' ' + unit)), el('div', { class: 'bar' }, el('i', { style: 'width:' + pct + '%;background:' + (pct >= 100 ? 'var(--accent)' : pct >= 50 ? 'var(--c)' : 'var(--over)') })))); }
+  body.append(el('div', { class: 'hint' }, total ? (known === total ? 'From the food database (CNF/USDA). Estimates from photos and quick-add foods don’t carry vitamins and minerals.' : `${known} of ${total} items have vitamin/mineral data — photo estimates, scanned and quick-add foods don’t.`) : 'Log foods from the database to see vitamins and minerals.'));
+  const tog = el('button', { class: 'chip', onclick: () => { body.hidden = !body.hidden; tog.textContent = body.hidden ? 'Show' : 'Hide'; try { localStorage.setItem('pl:micro_open', body.hidden ? '0' : '1'); } catch (e) {} } }, open ? 'Hide' : 'Show');
+  const low = MICROS.filter(([k]) => total && (t[k] || 0) < microTarget(k) * 0.5).map(m => m[1]);
+  return el('div', { class: 'card stack' }, el('div', { class: 'section-h' }, el('h2', {}, 'Vitamins & minerals'), tog), !body.hidden ? null : el('div', { class: 'hint' }, total ? (low.length ? 'Under half target so far: ' + low.slice(0, 4).join(', ') + (low.length > 4 ? '…' : '') : 'On track across the board.') : 'Log foods to see them.'), body);
+}
+
+// ---------- Weekly budget (calorie banking) ----------
+const weekStartOf = ds => { const [y, m, d] = ds.split('-').map(Number); const dt = new Date(y, m - 1, d); const dow = (dt.getDay() + 6) % 7; return addDays(ds, -dow); };
+async function weekBudget(date) {
+  const st = S.settings; const start = weekStartOf(date); const days = []; for (let i = 0; i < 7; i++) days.push(addDays(start, i));
+  const idx = days.indexOf(date); let past = 0, pastLogged = 0;
+  for (let i = 0; i < idx; i++) { const d = await loadDay(days[i]); if (d.entries.length) { past += totals(d).kcal - (st.netMode ? burned(d) : 0); pastLogged++; } else past += st.kcal; }
+  const today = await loadDay(date); const todayK = totals(today).kcal - (st.netMode ? burned(today) : 0);
+  const budget = st.kcal * 7; const remainingDays = 7 - idx; const allowance = (budget - past) / remainingDays; const bank = st.kcal * idx - past;
+  return { start, idx, past, pastLogged, todayK, budget, remainingDays, allowance, bank, todayLeft: allowance - todayK };
+}
+function weekCard(wb) {
+  const st = S.settings; const over = wb.allowance < st.kcal * 0.7;
+  const line = wb.idx === 0 ? `New week. Budget ${r0(wb.budget).toLocaleString()} kcal for 7 days.` : `${wb.bank >= 0 ? r0(wb.bank).toLocaleString() + ' kcal banked' : r0(-wb.bank).toLocaleString() + ' kcal over'} from ${wb.idx} day${wb.idx > 1 ? 's' : ''} → ${r0(wb.allowance).toLocaleString()} kcal/day for the remaining ${wb.remainingDays} day${wb.remainingDays > 1 ? 's' : ''}` + (wb.pastLogged < wb.idx ? ` (${wb.idx - wb.pastLogged} unlogged day${wb.idx - wb.pastLogged > 1 ? 's' : ''} counted at target)` : '') + '.';
+  const pct = Math.min(1, Math.max(0, (wb.past + wb.todayK) / wb.budget)) * 100;
+  return el('div', { class: 'card stack' }, el('div', { class: 'section-h' }, el('h2', {}, 'This week'), el('span', { class: 'hint' }, `${r0(wb.past + wb.todayK).toLocaleString()} / ${r0(wb.budget).toLocaleString()} kcal`)),
+    el('div', { class: 'bar' }, el('i', { class: over ? 'over' : '', style: 'width:' + pct + '%' })),
+    el('div', { class: 'hint' }, line), over ? el('div', { class: 'hint' }, 'Tip: a weekly budget lets a big day be balanced by lighter ones — no need to “make it up” all at once.') : null);
+}
+
+// ---------- Adaptive expenditure (compare what you ate with how your weight moved) ----------
+async function expenditureEstimate() {
+  const days = (await store.recentDays(35)).filter(d => d.date >= addDays(todayStr(), -28) && d.date < todayStr()).sort((a, b) => a.date.localeCompare(b.date));
+  const logged = days.filter(d => d.entries.length >= 1 && totals(d).kcal >= 600);
+  const weights = days.filter(d => d.weight);
+  if (logged.length < 10 || weights.length < 6) return { ok: false, reason: `Needs at least 10 fully logged days and 6 weigh-ins in the last 4 weeks (have ${logged.length} and ${weights.length}).` };
+  const span = (new Date(weights[weights.length - 1].date) - new Date(weights[0].date)) / 864e5; if (span < 13) return { ok: false, reason: 'Weigh-ins need to span at least two weeks.' };
+  const ma = movingAvg(weights); const rate = (ma[ma.length - 1].avg - ma[0].avg) / span * 7; // kg/week
+  const avgIntake = logged.reduce((a, d) => a + totals(d).kcal, 0) / logged.length;
+  const observed = avgIntake - rate * 7700 / 7;
+  const pr = S.settings.profile || {}; let formula = null;
+  if (pr.age && pr.height) { const w = ma[ma.length - 1].avg; formula = (10 * w + 6.25 * pr.height - 5 * pr.age + (pr.sex === 'f' ? -161 : 5)) * parseFloat(pr.act || 1.375); }
+  const conf = Math.min(1, (logged.length / 21) * Math.min(1, span / 21)); // 0..1
+  const tdee = formula ? conf * observed + (1 - conf) * formula : observed;
+  return { ok: true, tdee: Math.round(tdee / 10) * 10, observed: Math.round(observed), formula: formula && Math.round(formula), avgIntake: Math.round(avgIntake), rate, logged: logged.length, weighIns: weights.length, span: Math.round(span), conf };
+}
+function makePlan(kcal, w, r, sex) {
+  const floor = sex === 'f' ? 1200 : 1500; if (kcal < floor) kcal = floor;
+  const p = Math.round(Math.min(2.2, Math.max(1.6, r < 0 ? 2.0 : 1.7)) * w); const f = Math.round(kcal * 0.28 / 9); const c = Math.max(50, Math.round((kcal - p * 4 - f * 9) / 4)); const fib = Math.round(kcal / 1000 * 14);
+  return { kcal: Math.round(kcal / 10) * 10, p, c, f, fib };
+}
+async function applyAdaptive(est, silent) {
+  const st = S.settings; const pr = st.profile || {}; const r = parseFloat(pr.rate || 0); const w = pr.weight || S.lastWeight || 80;
+  const plan = makePlan(est.tdee + r * 7700 / 7, w, r, pr.sex); const old = st.kcal; Object.assign(st, plan); st.lastAdjust = todayStr(); st.tdee = est.tdee;
+  await store.set('settings/main', st); if (!silent) toast(`Target ${old} → ${plan.kcal} kcal`); return plan;
+}
+async function adaptiveCard() {
+  const st = S.settings; const est = await expenditureEstimate(); const pr = st.profile || {};
+  const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Adaptive maintenance'));
+  if (!est.ok) { c.append(el('div', { class: 'hint' }, 'Works out what you really burn by comparing what you ate with how your weight moved. ' + est.reason)); return c; }
+  const r = parseFloat(pr.rate || 0); const suggested = makePlan(est.tdee + r * 7700 / 7, pr.weight || S.lastWeight || 80, r, pr.sex);
+  c.append(el('div', { class: 'preview' }, el('div', {}, el('div', { class: 'num big' }, est.tdee.toLocaleString() + ' kcal'), el('div', { class: 'hint' }, 'estimated daily burn')), el('div', {}, el('div', { class: 'hint' }, `You averaged ${est.avgIntake.toLocaleString()} kcal/day over ${est.logged} logged days while your weight trend moved ${est.rate > 0 ? '+' : ''}${est.rate.toFixed(2)} kg/week.`))),
+    el('div', { class: 'hint' }, `Observed burn ${est.observed.toLocaleString()} kcal` + (est.formula ? ` blended ${r0(est.conf * 100)}% with the formula estimate (${est.formula.toLocaleString()}); more logged days = more weight on real data.` : '. Fill in the target calculator under Settings to blend with a formula estimate.') + ` Suggested target for “${(GOAL_RATES.find(g => g[0] === (pr.rate || '0')) || ['', 'maintain'])[1].toLowerCase()}”: ${suggested.kcal} kcal (current ${st.kcal}).`));
+  const auto = el('input', { type: 'checkbox', id: 'autoAdj', checked: st.autoAdjust ? '' : null }); auto.addEventListener('change', async () => { st.autoAdjust = auto.checked; await store.set('settings/main', st); toast(auto.checked ? 'Targets will update every week' : 'Auto-adjust off'); });
+  c.append(el('div', { class: 'row' }, el('button', { class: 'btn', onclick: async () => { await applyAdaptive(est); renderTrends(); } }, 'Use ' + suggested.kcal + ' kcal')), el('label', { class: 'hint' }, auto, ' Adjust my targets automatically every week', st.lastAdjust ? ` (last: ${st.lastAdjust})` : ''));
+  return c;
+}
+async function maybeAutoAdjust() {
+  const st = S.settings; if (!st.autoAdjust) return; if (st.lastAdjust && addDays(st.lastAdjust, 7) > todayStr()) return;
+  const est = await expenditureEstimate(); if (!est.ok) return; const old = st.kcal; const plan = await applyAdaptive(est, true);
+  if (plan.kcal !== old) toast(`Weekly check-in: target ${old} → ${plan.kcal} kcal (burn ≈ ${est.tdee})`); refreshView();
+}
+
+// ---------- Voice input ----------
+function micButton(target) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return el('span', { class: 'hint' }, 'Tip: tap the microphone key on your keyboard to dictate.');
+  let rec = null; const b = el('button', { class: 'chip', type: 'button' }, '🎤 Speak');
+  b.onclick = () => {
+    if (rec) { rec.stop(); return; }
+    rec = new SR(); rec.lang = 'en-CA'; rec.interimResults = true; rec.continuous = false; const base = target.value ? target.value.trim() + ' ' : '';
+    rec.onresult = e => { let t = ''; for (const r of e.results) t += r[0].transcript; target.value = base + t; };
+    rec.onend = () => { rec = null; b.textContent = '🎤 Speak'; target.dispatchEvent(new Event('input')); };
+    rec.onerror = e => { toast(e.error === 'not-allowed' ? 'Microphone access was blocked' : 'Could not hear that — try again'); };
+    try { rec.start(); b.textContent = '■ Stop'; } catch (e) { rec = null; }
+  };
+  return b;
+}
+
+// ---------- Claude coach ----------
+async function coachData(nDays) {
+  const t = todayStr(); const out = []; const st = S.settings;
+  for (let i = nDays; i >= 1; i--) { const ds = addDays(t, -i); const d = await loadDay(ds); if (!d.entries.length && !d.weight) continue; const tt = totals(d); const mt = microTotals(d.entries);
+    out.push({ date: ds, kcal: r0(tt.kcal), protein: r0(tt.p), carbs: r0(tt.c), fat: r0(tt.f), fibre: r0(tt.fib), sugar: r0(tt.sug), sodium: r0(tt.na), weight: d.weight || undefined, activity_kcal: burned(d) || undefined, meals: st.meals.map(m => ({ meal: m, items: d.entries.filter(e => e.meal === m).map(e => e.name + ' ' + r0(e.kcal) + 'kcal') })).filter(m => m.items.length), low_micros: MICROS.filter(([k]) => mt.known && (mt.t[k] || 0) < microTarget(k) * 0.5).map(m => m[1]) }); }
+  return { targets: { kcal: st.kcal, protein: st.p, carbs: st.c, fat: st.f, fibre: st.fib, sugar: st.sug, sodium: st.na, goal_weight: st.goalWeight || undefined, goal: (GOAL_RATES.find(g => g[0] === ((st.profile || {}).rate || '0')) || ['', ''])[1] }, days: out };
+}
+const COACH_PROMPT = data => `You are a supportive, evidence-based nutrition coach reviewing one person's food diary for the past week. Be specific and practical, refer to actual foods they logged, and keep a warm, non-judgmental tone. Do not give medical advice. Data (JSON): ${JSON.stringify(data)}
+Reply with ONLY this JSON: {"headline":"one sentence overall verdict","wins":["2-3 specific things that went well"],"fixes":["2-3 specific, easy changes for next week, each naming a food or meal"],"pattern":"one sentence about a pattern you noticed (timing, weekends, a meal that is consistently low/high)","next_week":"one clear focus for next week"}`;
+function coachCard() {
+  const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Weekly review by Claude'));
+  const out = el('div', { class: 'stack' }); const last = store.lsGet('coach/last');
+  const paint = r => { out.innerHTML = ''; if (!r) return; out.append(el('div', {}, el('strong', {}, r.headline || '')), el('div', { class: 'hint' }, 'Review of the week to ' + (r.date || '')));
+    const sec = (title, items) => { if (!items || !items.length) return; out.append(el('div', {}, el('b', {}, title)), el('ul', { style: 'margin:4px 0 0 18px;padding:0' }, ...items.map(x => el('li', { style: 'margin:3px 0' }, x)))); };
+    sec('What went well', r.wins); sec('Easy fixes', r.fixes); if (r.pattern) out.append(el('div', {}, el('b', {}, 'Pattern'), ' ', r.pattern)); if (r.next_week) out.append(el('div', { class: 'warn' }, 'Focus for next week: ' + r.next_week)); };
+  paint(last);
+  const status = el('div', { class: 'hint' });
+  const go = el('button', { class: 'btn', onclick: async () => { if (!(S.settings.apiKey || '').trim()) { status.textContent = AI_ERR.no_key; return; } go.disabled = true; status.innerHTML = ''; status.append(el('span', { class: 'spin' }), 'Claude is reading your week…');
+    try { const data = await coachData(7); if (data.days.length < 3) throw { code: 'few', message: 'Log at least 3 days first.' }; const r = await askClaude(COACH_PROMPT(data), null); r.date = todayStr(); await store.set('coach/last', r); paint(r); status.textContent = ''; }
+    catch (e) { status.textContent = AI_ERR[e.code] || e.message || 'Something went wrong.'; } finally { go.disabled = false; } } }, last ? 'Run a new review' : 'Review my week');
+  c.append(el('div', { class: 'hint' }, 'Sends the last 7 days of your diary (foods, totals, weight — nothing else) to Claude with your own API key and gets back what worked, what to fix, and one focus for next week.'), out, go, status);
+  return c;
+}
+const SUGGEST_PROMPT = (ctx) => `You are a practical nutrition coach. Suggest what this person could eat next. Context (JSON): ${JSON.stringify(ctx)}
+Rules: fit within the remaining calories and macro gaps for today (prioritise the macro furthest behind, usually protein), prefer foods they have eaten before or saved when sensible, keep it realistic for a home kitchen in Ontario, and give real portion sizes.
+Reply with ONLY this JSON: {"suggestions":[{"name":"short dish name with portions","grams":350,"kcal":520,"protein":40,"carbs":45,"fat":18,"fibre":6,"sugar":5,"sodium":600,"why":"one short sentence"}]} with exactly 3 suggestions ordered by fit.`;
+async function suggestMeal(meal) {
+  const day = await loadDay(S.date); const st = S.settings; const t = totals(day); const goal = st.kcal + (st.netMode ? burned(day) : 0);
+  const ctx = { meal, remaining: { kcal: r0(goal - t.kcal), protein: r0(st.p - t.p), carbs: r0(st.c - t.c), fat: r0(st.f - t.f), fibre: r0(st.fib - t.fib) }, eaten_today: day.entries.map(e => e.name), saved_foods: S.custom.slice(0, 25).map(f => f.name), recipes: S.meals.filter(m => m.type === 'recipe').slice(0, 15).map(m => m.name), recent: S.recent.slice(0, 15).map(f => f.name), time: new Date().getHours() };
+  const status = el('div', { class: 'status' }); const out = el('div', { class: 'stack' });
+  openSheet('What should I eat?', el('div', { class: 'stack' }, el('div', { class: 'hint' }, `${ctx.remaining.kcal} kcal and ${ctx.remaining.protein} g protein left today.`), status, out));
+  if (!(st.apiKey || '').trim()) { status.textContent = AI_ERR.no_key; return; }
+  status.append(el('span', { class: 'spin' }), 'Claude is thinking…');
+  try { const r = await askClaude(SUGGEST_PROMPT(ctx), null); status.textContent = '';
+    for (const s of (r.suggestions || []).slice(0, 3)) {
+      const n = { kcal: +s.kcal || 0, p: +s.protein || 0, c: +s.carbs || 0, f: +s.fat || 0, fib: +s.fibre || 0, sug: +s.sugar || 0, na: +s.sodium || 0 };
+      out.append(el('div', { class: 'card stack', style: 'background:var(--surface2)' }, el('div', {}, el('strong', {}, s.name), el('div', { class: 'hint' }, s.why || '')), el('div', { class: 'hint' }, `${r0(n.kcal)} kcal · P ${r0(n.p)} · C ${r0(n.c)} · F ${r0(n.f)}`),
+        el('div', { class: 'row' }, el('button', { class: 'btn', onclick: async () => { const d = await loadDay(S.date); d.entries.push({ id: uid(), meal, name: s.name, qty: r0(+s.grams || 0) || 1, unitLabel: s.grams ? 'g' : 'serving', grams: +s.grams || 0, ...n, src: 'ai', ts: Date.now() }); await saveDay(S.date); closeSheet(); renderToday(); toast('Logged · ' + r0(n.kcal) + ' kcal'); } }, 'Log this'), el('button', { class: 'btn ghost', onclick: () => openAdd(meal, 'describe', s.name) }, 'Adjust first'))));
+    }
+  } catch (e) { status.textContent = AI_ERR[e.code] || ('Something went wrong (' + (e.message || e.code) + ').'); }
+}
+
+// ---------- Apple Health / Shortcuts hand-off ----------
+// A Shortcut opens https://mvb1610.github.io/plate-ledger/#health=weight:84.6,active:520,steps:9100,date:2026-09-20
+async function handleHealthUrl() {
+  const m = (location.hash + location.search).match(/health=([^&]+)/); if (!m) return false;
+  history.replaceState(null, '', location.pathname);
+  const kv = {}; for (const part of decodeURIComponent(m[1]).split(',')) { const [k, v] = part.split(':'); if (k && v !== undefined) kv[k.trim().toLowerCase()] = v.trim(); }
+  let date = kv.date && /^\d{4}-\d{2}-\d{2}$/.test(kv.date) ? kv.date : todayStr(); const day = await loadDay(date); const done = [];
+  const w = parseFloat(kv.weight); if (w > 20 && w < 400) { day.weight = Math.round(w * 10) / 10; done.push(day.weight + ' kg'); }
+  const a = parseFloat(kv.active); if (a > 0 && a < 6000) { day.exercise = (day.exercise || []).filter(x => x.src !== 'health'); day.exercise.push({ id: uid(), name: 'Apple Health · active energy' + (kv.steps ? ` · ${parseInt(kv.steps).toLocaleString()} steps` : ''), min: 0, kcal: Math.round(a), src: 'health' }); done.push(Math.round(a) + ' kcal active'); }
+  if (done.length) { await saveDay(date); S.date = date; toast('From Apple Health (' + fmtDate(date) + '): ' + done.join(', ')); }
+  return true;
+}
+function healthCard() {
+  const url = APP_URL + '#health=weight:84.6,active:520,steps:9100,date:' + todayStr();
+  return el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Apple Health (via Shortcuts)'),
+    el('div', { class: 'hint' }, 'A web app can’t read Apple Health directly, but the Shortcuts app can and can hand the numbers to Plate Ledger through a link. One-time setup on your iPhone, then it runs by itself every morning:'),
+    el('ol', { style: 'margin:0 0 0 18px;padding:0;font-size:14px;line-height:1.5' },
+      el('li', {}, 'Open the link below once in Safari and sign in with Google there too (Safari and the home-screen app keep separate storage; the cloud joins them).'),
+      el('li', {}, 'Shortcuts → Automation → + → Time of Day, 7:00, Daily → Run immediately.'),
+      el('li', {}, 'Add action “Find Health Samples” (Weight, latest, limit 1) → “Get Details of Health Sample” (Value). Add “Find Health Samples” (Active Energy, Start Date is yesterday, group by day, Sum).'),
+      el('li', {}, 'Add “Text”: ', el('code', {}, 'https://mvb1610.github.io/plate-ledger/#health=weight:[Weight],active:[Active Energy],date:[Yesterday formatted yyyy-MM-dd]'), ' — insert the variables.'),
+      el('li', {}, 'Add “Open URLs” with that text. Done — each morning yesterday’s weigh-in and active calories land in your diary and sync everywhere.')),
+    el('div', { class: 'hint' }, 'Format: ', el('code', {}, 'weight' ), ' in kg, ', el('code', {}, 'active'), ' in kcal, ', el('code', {}, 'steps'), ' optional, ', el('code', {}, 'date'), ' optional (defaults to today). Example:'),
+    el('div', { class: 'row' }, el('input', { readonly: '', value: url, style: 'flex:1;font-size:12px' }), el('button', { class: 'btn ghost', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url).then(() => toast('Copied')); } }, 'Copy')),
+    el('div', { class: 'hint' }, 'Android: the same link works from Tasker/MacroDroid with Health Connect.'));
+}
+
 // ---------- Entry edit ----------
 function openEntry(e) {
   const food = { id: e.foodId, name: e.name, per: e.grams, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib, sug: e.sug, na: e.na, servings: e.unitLabel !== 'g' ? [[e.unitLabel, e.grams / (e.qty || 1)]] : [], src: e.src };
@@ -732,6 +904,9 @@ async function renderTrends() {
     const tr = weightTrend(weights); if (tr) wc.append(el('div', { class: 'hint' }, tr.text));
   }
   root.append(wc);
+  root.append(await adaptiveCard());
+  root.append(coachCard());
+  root.append(microWeekCard(days));
   // macro split
   const mt = logged.length ? last14.filter(x => x.logged).map(x => totals(byDate[x.ds])) : [];
   if (mt.length) { const m = mt.reduce((a, t) => ({ p: a.p + t.p, c: a.c + t.c, f: a.f + t.f }), { p: 0, c: 0, f: 0 }); const kc = m.p * 4 + m.c * 4 + m.f * 9 || 1;
@@ -741,6 +916,19 @@ async function renderTrends() {
   }
 }
 
+function microWeekCard(days) {
+  const t = todayStr(); const recent = days.filter(d => d.date > addDays(t, -8) && d.date <= t && d.entries.length);
+  const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Vitamins & minerals · 7-day average'));
+  if (!recent.length) { c.append(el('div', { class: 'hint' }, 'Nothing logged this week yet.')); return c; }
+  const acc = {}; let known = 0, total = 0; for (const d of recent) { const mt = microTotals(d.entries); known += mt.known; total += mt.total; for (const k in mt.t) acc[k] = (acc[k] || 0) + mt.t[k]; }
+  const low = [], ok = [];
+  for (const [k, label, unit] of MICROS) { const avg = (acc[k] || 0) / recent.length; const tg = microTarget(k); const pct = tg ? avg / tg * 100 : 0; (pct < 70 ? low : ok).push({ k, label, unit, avg, pct }); }
+  const row = x => el('div', { class: 'macro' }, el('div', { class: 'lbl' }, el('span', {}, x.label), el('b', {}, fmtMicro(x.k, x.avg) + ' ' + x.unit + ' · ' + r0(x.pct) + '%')), el('div', { class: 'bar' }, el('i', { style: 'width:' + Math.min(100, x.pct) + '%;background:' + (x.pct >= 100 ? 'var(--accent)' : x.pct >= 70 ? 'var(--c)' : 'var(--over)') })));
+  if (low.length) c.append(el('div', { class: 'warn' }, 'Consistently under 70% of target: ' + low.map(x => x.label).join(', ') + '.'), ...low.map(row)); else c.append(el('div', { class: 'hint' }, 'Everything tracked is at or near target — nice.'));
+  if (ok.length) c.append(el('div', { class: 'hint' }, 'On track: ' + ok.map(x => x.label + ' ' + r0(x.pct) + '%').join(' · ')));
+  c.append(el('div', { class: 'hint' }, `Based on ${recent.length} logged day${recent.length > 1 ? 's' : ''}; ${total ? r0(known / total * 100) : 0}% of items carried vitamin/mineral data (database foods do, photo estimates and quick-adds don’t).`));
+  return c;
+}
 // ---------- Settings ----------
 function renderSettings() {
   const root = $('#scr-settings'); root.innerHTML = ''; const st = S.settings;
@@ -771,6 +959,7 @@ function renderSettings() {
     el('div', { class: 'row' }, el('button', { class: 'btn ghost', onclick: exportCsv }, 'Export CSV'), el('button', { class: 'btn ghost', onclick: exportBackup }, 'Backup (JSON)')),
     el('button', { class: 'btn ghost', onclick: () => imp.click() }, 'Restore from backup'), imp,
     el('div', { class: 'hint' }, `Food database: ${CNF.length.toLocaleString()} Canadian Nutrient File + ${USDA.length.toLocaleString()} USDA foods. Version ${APP_VERSION}.`)));
+  root.append(healthCard());
 }
 function accountCard() {
   const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Cloud sync'));
@@ -815,13 +1004,15 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.3.0';
 (async () => {
   reloadStateFromLocal();
   cloud.init();
   const recent = await store.recentDays(30); const lw = recent.find(d => d.weight); if (lw) S.lastWeight = lw.weight;
   let tab = 'today'; try { tab = localStorage.getItem('pl:tab') || 'today'; } catch (e) {}
+  if (await handleHealthUrl()) tab = 'today';
   showTab(tab);
+  maybeAutoAdjust();
   await loadFoods();
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
