@@ -1,4 +1,4 @@
-const CACHE = 'plate-ledger-v1.2.0';
+const CACHE = 'plate-ledger-v1.2.1';
 const SHELL = ['./', './index.html', './app.js', './manifest.json', './data/cnf.json', './data/usda.json', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 const FB = ['https://www.gstatic.com/firebasejs/12.3.0/firebase-app-compat.js', 'https://www.gstatic.com/firebasejs/12.3.0/firebase-auth-compat.js', 'https://www.gstatic.com/firebasejs/12.3.0/firebase-firestore-compat.js'];
 // Install: fetch every shell file fresh from the network (bypassing the HTTP cache) so a new version never ships stale files.
