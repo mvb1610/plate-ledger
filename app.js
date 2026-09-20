@@ -809,8 +809,17 @@ async function suggestMeal(meal) {
 
 // ---------- Apple Health / Shortcuts hand-off ----------
 // A Shortcut opens https://mvb1610.github.io/plate-ledger/#health=weight:84.6,active:520,steps:9100,date:2026-09-20
+const HEALTH_SHORTCUT = 'Plate Ledger to Health';
+async function sendDayToHealth(date) {
+  const day = await loadDay(date); const t = totals(day); if (!day.entries.length) { toast('Nothing logged for ' + fmtDate(date)); return; }
+  const payload = `date:${date},kcal:${r0(t.kcal)},protein:${r1(t.p)},carbs:${r1(t.c)},fat:${r1(t.f)},fibre:${r1(t.fib)},sugar:${r1(t.sug)},sodium:${r0(t.na)}` + (day.weight ? `,weight:${day.weight}` : '');
+  location.href = 'shortcuts://run-shortcut?name=' + encodeURIComponent(HEALTH_SHORTCUT) + '&input=text&text=' + encodeURIComponent(payload);
+}
 async function handleHealthUrl() {
+  const th = (location.hash + location.search).match(/tohealth(?:=(\d{4}-\d{2}-\d{2}))?/);
+  if (th) { history.replaceState(null, '', location.pathname); await sendDayToHealth(th[1] || addDays(todayStr(), -1)); return true; }
   const m = (location.hash + location.search).match(/health=([^&]+)/); if (!m) return false;
+
   history.replaceState(null, '', location.pathname);
   const kv = {}; for (const part of decodeURIComponent(m[1]).split(',')) { const [k, v] = part.split(':'); if (k && v !== undefined) kv[k.trim().toLowerCase()] = v.trim(); }
   let date = kv.date && /^\d{4}-\d{2}-\d{2}$/.test(kv.date) ? kv.date : todayStr(); const day = await loadDay(date); const done = [];
@@ -821,17 +830,14 @@ async function handleHealthUrl() {
 }
 function healthCard() {
   const url = APP_URL + '#health=weight:84.6,active:520,steps:9100,date:' + todayStr();
-  return el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Apple Health (via Shortcuts)'),
-    el('div', { class: 'hint' }, 'A web app can’t read Apple Health directly, but the Shortcuts app can and can hand the numbers to Plate Ledger through a link. One-time setup on your iPhone, then it runs by itself every morning:'),
-    el('ol', { style: 'margin:0 0 0 18px;padding:0;font-size:14px;line-height:1.5' },
-      el('li', {}, 'Open the link below once in Safari and sign in with Google there too (Safari and the home-screen app keep separate storage; the cloud joins them).'),
-      el('li', {}, 'Shortcuts → Automation → + → Time of Day, 7:00, Daily → Run immediately.'),
-      el('li', {}, 'Add action “Find Health Samples” (Weight, latest, limit 1) → “Get Details of Health Sample” (Value). Add “Find Health Samples” (Active Energy, Start Date is yesterday, group by day, Sum).'),
-      el('li', {}, 'Add “Text”: ', el('code', {}, 'https://mvb1610.github.io/plate-ledger/#health=weight:[Weight],active:[Active Energy],date:[Yesterday formatted yyyy-MM-dd]'), ' — insert the variables.'),
-      el('li', {}, 'Add “Open URLs” with that text. Done — each morning yesterday’s weigh-in and active calories land in your diary and sync everywhere.')),
-    el('div', { class: 'hint' }, 'Format: ', el('code', {}, 'weight' ), ' in kg, ', el('code', {}, 'active'), ' in kcal, ', el('code', {}, 'steps'), ' optional, ', el('code', {}, 'date'), ' optional (defaults to today). Example:'),
+  const code = t => el('code', { style: 'font-size:12px' }, t);
+  return el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Apple Health'),
+    el('div', { class: 'hint' }, 'A web app can’t talk to Apple Health directly, so the Shortcuts app is the bridge in both directions. Full step-by-step instructions are in the chat where this app was built; the short version:'),
+    el('div', {}, el('b', {}, 'Plate Ledger → Health'), el('div', { class: 'hint' }, 'Tap the button below (or open ', code(APP_URL + '#tohealth'), ' from a nightly Shortcut automation). It hands yesterday’s totals to a Shortcut named “', HEALTH_SHORTCUT, '”, which logs Dietary Energy, Protein, Carbs, Fat, Fibre, Sugar and Sodium into Health.')),
+    el('div', { class: 'row' }, el('button', { class: 'btn ghost', onclick: () => sendDayToHealth(S.date) }, 'Send ' + fmtDate(S.date) + ' to Health'), el('button', { class: 'btn ghost', onclick: () => sendDayToHealth(addDays(todayStr(), -1)) }, 'Send yesterday')),
+    el('div', {}, el('b', {}, 'Health → Plate Ledger'), el('div', { class: 'hint' }, 'A morning Shortcut automation opens a link like the one below with your latest weight and yesterday’s active calories; the app files them into that day.')),
     el('div', { class: 'row' }, el('input', { readonly: '', value: url, style: 'flex:1;font-size:12px' }), el('button', { class: 'btn ghost', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url).then(() => toast('Copied')); } }, 'Copy')),
-    el('div', { class: 'hint' }, 'Android: the same link works from Tasker/MacroDroid with Health Connect.'));
+    el('div', { class: 'hint' }, 'Because Shortcuts opens links in Safari rather than the home-screen app, sign in with Google in Safari once too — the cloud keeps both in sync.'));
 }
 
 // ---------- Entry edit ----------
@@ -1004,7 +1010,7 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 (async () => {
   reloadStateFromLocal();
   cloud.init();
