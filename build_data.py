@@ -36,14 +36,15 @@ def build_cnf():
     names = {os.path.basename(n).lower(): n for n in z.namelist()}
     rd = lambda fn: rows_csv(z.read(names[fn.lower()]))
     groups = {r['CNF_Food_Group_Code']: r['CNF_Food_Group_Description_EN'] for r in rd('CNF_Food_Group.csv')}
-    micro_codes = dict(MICRO); vd_iu = set()
+    micro_codes = dict(MICRO)
     try:  # CNF nutrient codes match USDA for these, but resolve by name to be safe and note vitamin D units
         for r in rd('Nutrient_Name.csv'):
             nm = (r.get('Nutrient_Name') or r.get('Nutrient_Name_EN') or '').upper(); code = r['Nutrient_Code']; unit = (r.get('Nutrient_Unit') or '').lower()
             for key, pat in [('ca', 'CALCIUM'), ('fe', 'IRON'), ('k', 'POTASSIUM'), ('mg', 'MAGNESIUM'), ('zn', 'ZINC'), ('b12', 'VITAMIN B-12'), ('vc', 'VITAMIN C'), ('fol', 'FOLATE, TOTAL')]:
                 if nm.startswith(pat) and code not in micro_codes: micro_codes[code] = key
-            if nm.startswith('VITAMIN D') and ('D2' in nm or 'D3' in nm or unit in ('\u00b5g', 'ug', 'mcg')) and code not in micro_codes: micro_codes[code] = 'vd'
-            if micro_codes.get(code) == 'vd' and unit == 'iu': vd_iu.add(code)
+            if nm.startswith('VITAMIN D') and code not in micro_codes: micro_codes[code] = 'vdiu' if unit == 'iu' else 'vd'
+            if micro_codes.get(code) == 'vd' and unit == 'iu': micro_codes[code] = 'vdiu'
+        print('CNF micronutrient codes:', micro_codes)
     except Exception as e:
         print('nutrient name lookup skipped:', e)
     nut = {}
@@ -51,9 +52,7 @@ def build_cnf():
         mk = micro_codes.get(r['Nutrient_Code'])
         if mk:
             try:
-                v = float(r['Nutrient_Amount'])
-                if r['Nutrient_Code'] in vd_iu: v = v / 40.0
-                nut.setdefault(r['Food_Code'], {}).setdefault(mk, v)
+                nut.setdefault(r['Food_Code'], {}).setdefault(mk, float(r['Nutrient_Amount']))
             except ValueError: pass
         k = WANT.get(r['Nutrient_Code'])
         if k:
@@ -74,6 +73,7 @@ def build_cnf():
         if grp == '3': continue  # baby foods
         n = nut.get(fid, {})
         if 'kcal' not in n: continue
+        if not n.get('vd') and n.get('vdiu'): n['vd'] = n['vdiu'] / 40.0  # IU -> µg
         g = lambda k: round(n.get(k, 0), 1)
         out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4], micro_row(n)])
     json.dump({'groups': groups, 'foods': out}, open(f'{OUT}/cnf.json', 'w'), separators=(',', ':'), ensure_ascii=False)
