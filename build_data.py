@@ -42,8 +42,10 @@ def build_cnf():
             nm = (r.get('Nutrient_Name') or r.get('Nutrient_Name_EN') or '').upper(); code = r['Nutrient_Code']; unit = (r.get('Nutrient_Unit') or '').lower()
             for key, pat in [('ca', 'CALCIUM'), ('fe', 'IRON'), ('k', 'POTASSIUM'), ('mg', 'MAGNESIUM'), ('zn', 'ZINC'), ('b12', 'VITAMIN B-12'), ('vc', 'VITAMIN C'), ('fol', 'FOLATE, TOTAL')]:
                 if nm.startswith(pat) and code not in micro_codes: micro_codes[code] = key
-            if nm.startswith('VITAMIN D') and code not in micro_codes: micro_codes[code] = 'vdiu' if unit == 'iu' else 'vd'
-            if micro_codes.get(code) == 'vd' and unit == 'iu': micro_codes[code] = 'vdiu'
+            if nm.startswith('VITAMIN D'):
+                # CNF carries vitamin D several ways: total D2+D3 in µg, D2 and D3 separately in µg, and a total in IU. Keep them apart and combine per food below.
+                micro_codes[code] = 'vdiu' if ('INTERNATIONAL' in nm or unit == 'iu') else 'vd3' if 'D3' in nm and 'D2' not in nm else 'vd2' if 'D2' in nm and 'D3' not in nm else 'vd'
+                print('CNF vitamin D code', code, repr(nm), repr(unit), '->', micro_codes[code])
         print('CNF micronutrient codes:', micro_codes)
     except Exception as e:
         print('nutrient name lookup skipped:', e)
@@ -73,7 +75,9 @@ def build_cnf():
         if grp == '3': continue  # baby foods
         n = nut.get(fid, {})
         if 'kcal' not in n: continue
-        if not n.get('vd') and n.get('vdiu'): n['vd'] = n['vdiu'] / 40.0  # IU -> µg
+        if not n.get('vd'):  # fall back to D2 + D3, then IU / 40
+            if n.get('vd2') or n.get('vd3'): n['vd'] = n.get('vd2', 0) + n.get('vd3', 0)
+            elif n.get('vdiu'): n['vd'] = n['vdiu'] / 40.0
         g = lambda k: round(n.get(k, 0), 1)
         out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4], micro_row(n)])
     json.dump({'groups': groups, 'foods': out}, open(f'{OUT}/cnf.json', 'w'), separators=(',', ':'), ensure_ascii=False)
