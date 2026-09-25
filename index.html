@@ -15,7 +15,9 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-192.png" type="image/png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Public+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://securetoken.googleapis.com" crossorigin>
 <style>
 :root{
   --bg:#F3F5F4; --surface:#FFFFFF; --surface2:#E9EDEB; --line:#D5DCD8;
@@ -48,6 +50,8 @@ html,body{height:100%}
 body{padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.45;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit;color:inherit}
+input,select,textarea{font-size:16px} /* 16px+ stops iOS from zooming into a field when you tap it */
+button,a,input,select,textarea,label{touch-action:manipulation}
 button{cursor:pointer}
 button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 h1,h2,h3{font-family:var(--display);margin:0;text-wrap:balance;letter-spacing:-.01em}
@@ -106,7 +110,8 @@ h1,h2,h3{font-family:var(--display);margin:0;text-wrap:balance;letter-spacing:-.
 .sheet .ft{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:10px}
 .x{background:var(--surface2);border:0;border-radius:999px;width:32px;height:32px;display:grid;place-items:center}
 .seg{display:flex;background:var(--surface2);border-radius:10px;padding:3px;gap:3px}
-.seg button{flex:1;border:0;background:none;border-radius:8px;padding:7px 4px;font-family:var(--display);font-weight:600;font-size:13px;color:var(--ink2)}
+.seg button{flex:1 1 auto;border:0;background:none;border-radius:8px;padding:7px 3px;font-family:var(--display);font-weight:600;font-size:13px;color:var(--ink2);white-space:nowrap}
+@media (max-width:400px){.seg button{font-size:12px;padding:7px 2px}}
 .seg button.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12)}
 .btn{border:0;border-radius:12px;padding:12px 16px;font-family:var(--display);font-weight:700;font-size:15px;background:var(--accent);color:var(--accent-ink);flex:1}
 .btn.ghost{background:var(--surface2);color:var(--ink)}
@@ -196,9 +201,6 @@ h1,h2,h3{font-family:var(--display);margin:0;text-wrap:balance;letter-spacing:-.
 <input type="file" id="photoInput" accept="image/*" capture="environment" hidden>
 <input type="file" id="fileInput" accept="image/*" hidden>
 
-<script src="https://www.gstatic.com/firebasejs/12.3.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/12.3.0/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/12.3.0/firebase-firestore-compat.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

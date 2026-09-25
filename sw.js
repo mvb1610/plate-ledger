@@ -1,16 +1,37 @@
-const CACHE = 'plate-ledger-v1.3.1';
-const SHELL = ['./', './index.html', './app.js', './manifest.json', './data/cnf.json', './data/usda.json', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
-const FB = ['https://www.gstatic.com/firebasejs/12.3.0/firebase-app-compat.js', 'https://www.gstatic.com/firebasejs/12.3.0/firebase-auth-compat.js', 'https://www.gstatic.com/firebasejs/12.3.0/firebase-firestore-compat.js'];
-// Install: fetch every shell file fresh from the network (bypassing the HTTP cache) so a new version never ships stale files.
-self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => Promise.all(SHELL.map(u => fetch(u, { cache: 'reload' }).then(r => { if (!r.ok) throw new Error(u); return c.put(u, r); }))).then(() => Promise.allSettled(FB.map(u => fetch(u, { mode: 'cors' }).then(r => c.put(u, r)))))).then(() => self.skipWaiting())); });
-// Activate: drop old caches, take over open pages and reload them so everyone is on the new version immediately.
-self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()).then(() => self.clients.matchAll({ type: 'window' })).then(cs => Promise.all(cs.map(c => c.navigate(c.url).catch(() => {}))))); });
+// Plate Ledger service worker.
+// build_data.py stamps content hashes into the two cache names (and lists the font files) at deploy time: every deploy
+// gets a fresh app cache, while the 2.6 MB food database keeps its own cache and is only downloaded again when it changes.
+const SHELL_CACHE = 'pl-shell-__SHELL__';
+const DATA_CACHE = 'pl-data-__DATA__';
+const SHELL = ['./', './index.html', './app.js', './manifest.json', './fonts/fonts.css', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', /*__FONTS__*/];
+const DATA = ['./data/cnf.json', './data/usda.json'];
+const put = async (cache, url) => { const r = await fetch(url, { cache: 'reload' }); if (!r.ok) throw new Error(url + ' ' + r.status); await cache.put(url, r); };
+
+self.addEventListener('install', e => e.waitUntil((async () => {
+  const shell = await caches.open(SHELL_CACHE);
+  await Promise.all(SHELL.map(u => put(shell, u)));
+  const data = await caches.open(DATA_CACHE);
+  await Promise.all(DATA.map(async u => { if (!(await data.match(u))) await put(data, u); }));
+  await self.skipWaiting();
+})()));
+
+self.addEventListener('activate', e => e.waitUntil((async () => {
+  const keys = await caches.keys();
+  const legacy = keys.some(k => k.startsWith('plate-ledger-')); // caches from app versions ≤ 1.3
+  await Promise.all(keys.filter(k => k !== SHELL_CACHE && k !== DATA_CACHE).map(k => caches.delete(k)));
+  await self.clients.claim();
+  if (legacy) for (const c of await self.clients.matchAll({ type: 'window' })) if (typeof c.navigate === 'function') c.navigate(c.url).catch(() => {}); // one-time hop onto this version
+})()));
+
+// Cache-first for the app's own files; no background re-downloads (a new deploy brings a new service worker instead).
 self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  if (e.request.method !== 'GET') return;
-  if (url.origin !== location.origin && !FB.includes(e.request.url)) return; // never touch the Anthropic API, Firebase traffic or fonts
-  e.respondWith(caches.match(e.request, { ignoreSearch: true }).then(cached => {
-    const fresh = fetch(e.request).then(res => { if (res.ok || res.type === 'opaque') caches.open(CACHE).then(c => c.put(e.request, res.clone())); return res; }).catch(() => cached);
-    return cached || fresh;
-  }));
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  if (new URL(req.url).origin !== location.origin) return; // Firestore, Google sign-in, Anthropic, Open Food Facts go straight to the network
+  e.respondWith((async () => {
+    const hit = await caches.match(req, { ignoreSearch: true });
+    if (hit) return hit;
+    if (req.mode === 'navigate') { const page = await caches.match('./index.html'); if (page) return page; }
+    return fetch(req);
+  })());
 });

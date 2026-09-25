@@ -19,102 +19,167 @@ const todayStr = () => { const d = new Date(); return d.getFullYear() + '-' + St
 const addDays = (s, n) => { const [y, m, d] = s.split('-').map(Number); const dt = new Date(y, m - 1, d + n); return dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0') + '-' + String(dt.getDate()).padStart(2, '0'); };
 const fmtDate = s => { const t = todayStr(); if (s === t) return 'Today'; if (s === addDays(t, -1)) return 'Yesterday'; const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString('en-CA', { weekday: 'short', month: 'short', day: 'numeric' }); };
 
-// ---------- Food database (loaded from data/*.json) ----------
-let FOODS = [], CNF = [], USDA = [];
-const MKEYS = ['ca', 'fe', 'k', 'mg', 'zn', 'vd', 'b12', 'vc', 'fol'];
-const SRC_LABEL = { cnf: 'CNF', usda: 'USDA', custom: 'My food' };
-const parseDb = (d, prefix, src) => d.foods.map(a => ({ id: prefix + a[0], name: a[1], group: d.groups[a[2]] || '', kcal: a[3], p: a[4], c: a[5], f: a[6], fib: a[7], sug: a[8], na: a[9], servings: a[10], per: 100, src, lc: a[1].toLowerCase(), m: a[11] && a[11].length ? Object.fromEntries(MKEYS.map((k, i) => [k, a[11][i] || 0])) : undefined }));
-async function loadFoods() {
-  const get = async f => { try { const r = await fetch(f); return r.ok ? await r.json() : null; } catch (e) { return null; } };
-  const [c, u] = await Promise.all([get('data/cnf.json'), get('data/usda.json')]);
-  CNF = c ? parseDb(c, 'c', 'cnf') : []; USDA = u ? parseDb(u, 'u', 'usda') : [];
-  FOODS = CNF.concat(USDA);
-  if (!FOODS.length) toast('Food database failed to load — check your connection');
-}
-// ---------- Storage: local cache + Firebase cloud sync ----------
+// ---------- Constants ----------
+const PROJECT = 'plate-ledger-8007d';
+const API_KEY = 'AIzaSyDcRdTEzGJa6YfFgesaefw90mHZZrTvaQo'; // public web key, restricted to this site
 const GOOGLE_CLIENT_ID = '697214158009-bbkc4g24jr4kjharq5da3i5t26b9nfng.apps.googleusercontent.com';
 const APP_URL = 'https://mvb1610.github.io/plate-ledger/';
-const isStandaloneApp = () => !!navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
-const FIREBASE_CONFIG = { apiKey: 'AIzaSyDcRdTEzGJa6YfFgesaefw90mHZZrTvaQo', authDomain: 'plate-ledger-8007d.firebaseapp.com', projectId: 'plate-ledger-8007d', storageBucket: 'plate-ledger-8007d.firebasestorage.app', messagingSenderId: '697214158009', appId: '1:697214158009:web:1189551d41ae8640e9c768' };
-const store = {
-  lsGet(k) { try { const v = localStorage.getItem('pl:' + k); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
-  lsSet(k, v) { try { localStorage.setItem('pl:' + k, JSON.stringify(v)); return true; } catch (e) { toast('Could not save — storage is full or blocked'); return false; } },
-  lsDel(k) { try { localStorage.removeItem('pl:' + k); } catch (e) {} },
-  async get(path) { return this.lsGet(path); },
-  async set(path, data) { const ok = this.lsSet(path, data); cloud.push(path, data); return ok; },
-  async recentDays(n) {
-    const out = [];
-    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/')) out.push(JSON.parse(localStorage.getItem(k))); } } catch (e) {}
-    return out.sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
-  },
-  allKeys() { const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('pl:days/') || k.startsWith('pl:settings/') || k.startsWith('pl:foods/') || k.startsWith('pl:coach/')) ks.push(k); } } catch (e) {} return ks; }
-};
-// Firestore rejects nested arrays (e.g. servings [['1 cup', 158]]), so inner arrays are wrapped as {__a: [...]} on the way up and unwrapped on the way down.
-const fsEnc = v => Array.isArray(v) ? v.map(x => Array.isArray(x) ? { __a: fsEnc(x) } : fsEnc(x)) : (v && typeof v === 'object') ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => [k, fsEnc(x)])) : v;
-const fsDec = v => Array.isArray(v) ? v.map(fsDec) : (v && typeof v === 'object') ? ('__a' in v && Object.keys(v).length === 1 ? fsDec(v.__a) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fsDec(x)]))) : v;
-// Cloud layer. Paths map to Firestore: days/<date> -> users/<uid>/days/<date>; anything else -> users/<uid>/meta/<path with / replaced by _>
-const cloud = {
-  ready: false, user: null, db: null, auth: null, status: 'off', lastSync: null, unsub: [], listeners: [],
-  onChange(fn) { this.listeners.push(fn); },
-  emit() { for (const fn of this.listeners) { try { fn(); } catch (e) {} } },
-  init() {
-    if (!window.firebase) { this.status = 'unavailable'; return; }
-    try {
-      firebase.initializeApp(FIREBASE_CONFIG);
-      this.auth = firebase.auth(); this.db = firebase.firestore();
-      try { this.db.settings({ ignoreUndefinedProperties: true }); } catch (e) {}
-      try { this.db.enablePersistence({ synchronizeTabs: true }).catch(() => {}); } catch (e) {}
-      this.ready = true; this.status = 'signedout';
-      this.auth.onAuthStateChanged(u => { this.user = u || null; if (u) this.start(); else this.stop(); this.emit(); });
-      this.handleOAuthReturn().catch(() => {});
-    } catch (e) { console.warn('firebase init failed', e); this.status = 'unavailable'; }
-  },
-  ref(path) {
-    const base = this.db.collection('users').doc(this.user.uid);
-    if (path.startsWith('days/')) return base.collection('days').doc(path.slice(5));
-    return base.collection('meta').doc(path.replace(/\//g, '_'));
-  },
-  push(path, data) {
-    if (!this.user || !this.db) return;
-    this.status = 'syncing'; this.emit();
-    this.ref(path).set(fsEnc(JSON.parse(JSON.stringify(data)))).then(() => { this.status = 'synced'; this.lastSync = Date.now(); this.emit(); })
-      .catch(e => { console.warn('cloud push failed', e); this.status = 'error'; this.error = e.code || e.message; this.emit(); });
-  },
-  async start() {
-    // 1) pull everything from the cloud; 2) upload anything only on this device; 3) listen for changes from other devices
-    this.status = 'syncing'; this.emit();
-    try {
-      const base = this.db.collection('users').doc(this.user.uid);
-      const [daysSnap, metaSnap] = await Promise.all([base.collection('days').get(), base.collection('meta').get()]);
-      const cloudKeys = new Set();
-      daysSnap.forEach(d => { cloudKeys.add('days/' + d.id); store.lsSet('days/' + d.id, fsDec(d.data())); });
-      metaSnap.forEach(d => { const k = d.id === 'settings_main' ? 'settings/main' : d.id === 'foods_custom' ? 'foods/custom' : d.id === 'foods_recent' ? 'foods/recent' : d.id === 'foods_meals' ? 'foods/meals' : d.id === 'coach_last' ? 'coach/last' : null; if (k) { cloudKeys.add(k); store.lsSet(k, fsDec(d.data())); } });
-      // upload local-only records (first sign-in on a device that already has a diary)
-      const ups = [];
-      for (const k of store.allKeys()) { const path = k.slice(3); if (!cloudKeys.has(path)) { const v = store.lsGet(path); if (v && typeof v === 'object') ups.push(this.ref(path).set(fsEnc(JSON.parse(JSON.stringify(v)))).catch(e => console.warn('upload failed', path, e))); } }
-      if (ups.length) await Promise.all(ups);
-      this.status = 'synced'; this.lastSync = Date.now();
-      // live listeners
-      this.stopListeners();
-      this.unsub.push(base.collection('days').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; if (c.type === 'removed') store.lsDel('days/' + c.doc.id); else store.lsSet('days/' + c.doc.id, fsDec(c.doc.data())); delete S.days[c.doc.id]; changed = true; }); if (changed) { this.lastSync = Date.now(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
-      this.unsub.push(base.collection('meta').onSnapshot(snap => { let changed = false; snap.docChanges().forEach(c => { if (c.doc.metadata.hasPendingWrites) return; const k = c.doc.id === 'settings_main' ? 'settings/main' : c.doc.id === 'foods_custom' ? 'foods/custom' : c.doc.id === 'foods_recent' ? 'foods/recent' : c.doc.id === 'foods_meals' ? 'foods/meals' : c.doc.id === 'coach_last' ? 'coach/last' : null; if (!k) return; store.lsSet(k, fsDec(c.doc.data())); changed = true; }); if (changed) { reloadStateFromLocal(); this.emit(); refreshView(); } }, e => { console.warn(e); }));
-    } catch (e) { console.warn('cloud sync failed', e); this.status = 'error'; this.error = e.code || e.message; }
-    reloadStateFromLocal(); S.days = {}; this.emit(); refreshView();
-  },
-  stopListeners() { for (const u of this.unsub) { try { u(); } catch (e) {} } this.unsub = []; },
-  stop() { this.stopListeners(); this.status = this.ready ? 'signedout' : 'unavailable'; },
-  async signIn() {
-    if (!this.ready) { toast('Cloud sync is not available right now'); return; }
-    // Installed iPhone/Android app: Safari blocks Firebase's popup and redirect flows, so go straight to Google and come back here.
-    if (isStandaloneApp()) { this.redirectToGoogle(); return; }
-    const provider = new firebase.auth.GoogleAuthProvider();
-    try { await this.auth.signInWithPopup(provider); }
-    catch (e) {
-      if (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request') return;
-      this.redirectToGoogle();
+const FS_ROOT = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
+const META = { settings_main: 'settings/main', foods_custom: 'foods/custom', foods_recent: 'foods/recent', foods_meals: 'foods/meals', coach_last: 'coach/last' };
+const SYNCED = /^(days|settings|foods|coach)\//; // everything else in localStorage stays on this device
+
+// ---------- Food database: fetched after the first screen is up; rows stay as compact arrays ----------
+const MKEYS = ['ca', 'fe', 'k', 'mg', 'zn', 'vd', 'b12', 'vc', 'fol'];
+const SRC_LABEL = { cnf: 'CNF', usda: 'USDA', custom: 'My food' };
+const DB = { ready: false, rows: [], lc: [], nc: null, src: null, groups: [{}, {}], count: [0, 0], byId: null, promise: null };
+function loadFoods() {
+  if (DB.promise) return DB.promise;
+  DB.promise = (async () => {
+    const get = async f => { try { const r = await fetch(f); return r.ok ? await r.json() : null; } catch (e) { return null; } };
+    const pause = () => new Promise(r => setTimeout(r, 0)); // keep taps responsive while 14,000 foods load
+    const c = await get('data/cnf.json'); await pause();
+    const u = await get('data/usda.json'); await pause();
+    const parts = [[c, 0], [u, 1]].filter(p => p[0] && Array.isArray(p[0].foods));
+    let n = 0; for (const [d] of parts) n += d.foods.length;
+    const rows = new Array(n), lc = new Array(n), nc = new Uint8Array(n), src = new Uint8Array(n);
+    let i = 0;
+    for (const [d, s] of parts) for (const a of d.foods) {
+      const l = String(a[1]).toLowerCase(); let k = 0, j = -1; while ((j = l.indexOf(',', j + 1)) >= 0) k++;
+      rows[i] = a; lc[i] = l; nc[i] = k > 255 ? 255 : k; src[i] = s; i++;
     }
+    Object.assign(DB, { rows, lc, nc, src, groups: [c && c.groups || {}, u && u.groups || {}], count: [c && c.foods ? c.foods.length : 0, u && u.foods ? u.foods.length : 0], byId: null, ready: n > 0 });
+    if (!n) { DB.promise = null; toast('Food database failed to load — check your connection'); }
+    return DB;
+  })();
+  return DB.promise;
+}
+function foodFromRow(i) {
+  const a = DB.rows[i], s = DB.src[i];
+  return { id: (s ? 'u' : 'c') + a[0], name: a[1], group: DB.groups[s][a[2]] || '', kcal: a[3], p: a[4], c: a[5], f: a[6], fib: a[7], sug: a[8], na: a[9], servings: a[10] || [], mi: a[11] && a[11].length ? a[11] : undefined, per: 100, src: s ? 'usda' : 'cnf', lc: DB.lc[i] };
+}
+function foodById(id) {
+  if (!DB.ready || !id) return null;
+  if (!DB.byId) { DB.byId = new Map(); for (let i = 0; i < DB.rows.length; i++) DB.byId.set((DB.src[i] ? 'u' : 'c') + DB.rows[i][0], i); }
+  const i = DB.byId.get(id); return i === undefined ? null : foodFromRow(i);
+}
+const microOf = f => f.m || (f.mi && f.mi.length ? Object.fromEntries(MKEYS.map((k, i) => [k, f.mi[i] || 0])) : null);
+
+// ---------- Local store: localStorage is the working copy; the cloud is the backup and the bridge between devices ----------
+const store = {
+  days: new Set(),    // dates that have a day document on this device
+  evicted: new Set(), // old days trimmed off this device to free space (they're still in the cloud)
+  init() {
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('pl:days/')) this.days.add(k.slice(8)); } } catch (e) {}
+    const ev = this.lsGet('sync/evicted'); if (Array.isArray(ev)) for (const d of ev) if (!this.days.has(d)) this.evicted.add(d);
   },
-  redirectToGoogle() {
+  raw(k) { try { return localStorage.getItem('pl:' + k); } catch (e) { return null; } },
+  lsGet(k) { const v = this.raw(k); if (!v) return null; try { return JSON.parse(v); } catch (e) { return null; } },
+  // Write one key. If storage is full, trim old days that are safely in the cloud — never days on/after `floor`
+  // (default: keep the last 120 days if possible, then 30, then 7), never unsynced edits.
+  put(k, json, floor) {
+    const write = () => { try { localStorage.setItem('pl:' + k, json); } catch (e) { return false; } if (k.startsWith('days/')) { const d = k.slice(5); this.days.add(d); if (this.evicted.delete(d)) this.saveEvicted(); } return true; };
+    if (write()) return true;
+    for (const before of floor ? [floor] : [-120, -30, -7].map(n => addDays(todayStr(), n))) while (this.makeRoom(k, before)) if (write()) return true;
+    return false;
+  },
+  lsSet(k, v) { return this.put(k, JSON.stringify(v)); },
+  lsDel(k) { try { localStorage.removeItem('pl:' + k); } catch (e) {} if (k.startsWith('days/')) this.days.delete(k.slice(5)); },
+  // A user edit: saved on this device immediately, uploaded in the background.
+  set(path, data) {
+    const prev = this.raw(path);
+    if (SYNCED.test(path) && data && typeof data === 'object') { const rev = revOf(prev); data = { ...data }; if (rev) data._rev = rev; else delete data._rev; } // which cloud version this edit is based on
+    const json = JSON.stringify(data);
+    if (prev === json) return true;
+    if (!this.put(path, json)) { toast('Could not save on this device — storage is full'); return false; }
+    if (SYNCED.test(path)) sync.markDirty(path, prev);
+    return true;
+  },
+  syncedKeys() { const out = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('pl:') && SYNCED.test(k.slice(3))) out.push(k.slice(3)); } } catch (e) {} return out; },
+  allKeys() { return this.syncedKeys().map(k => 'pl:' + k); },
+  usage() { let n = 0; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('pl:')) n += k.length + (localStorage.getItem(k) || '').length; } } catch (e) {} return n * 2; },
+  makeRoom(forKey, before) {
+    if (!auth.user) return false;
+    const dirty = sync.dirtyMap();
+    const drop = [...this.days].filter(d => d < before && 'days/' + d !== forKey && !dirty['days/' + d] && (this.raw('days/' + d) || '').includes('"_rev":')).sort().slice(0, 30); // has a cloud version
+    if (!drop.length) return false;
+    for (const d of drop) { try { localStorage.removeItem('pl:days/' + d); } catch (e) {} this.days.delete(d); this.evicted.add(d); delete S.days[d]; }
+    this.saveEvicted(); return true;
+  },
+  saveEvicted() { try { localStorage.setItem('pl:sync/evicted', JSON.stringify([...this.evicted])); } catch (e) {} },
+  // Days from the last n calendar days (and any future-dated ones), newest first. Cost grows with n, not with diary size.
+  recentDays(n) {
+    const from = addDays(todayStr(), -(n - 1)), out = [];
+    for (const d of this.days) if (d >= from) { const x = dayLocal(d); if (x) out.push(x); }
+    return out.sort((a, b) => b.date.localeCompare(a.date));
+  },
+  async allDays() {
+    const out = []; for (const d of this.days) { const x = dayLocal(d); if (x) out.push(x); }
+    if (this.evicted.size && auth.user) {
+      try { const { docs } = await fsQuery('days', 0); for (const doc of docs) if (this.evicted.has(doc.id)) out.push(doc.data); }
+      catch (e) { toast('Some older days are only in the cloud and could not be fetched'); }
+    }
+    return out.sort((a, b) => a.date.localeCompare(b.date));
+  }
+};
+function revOf(raw) { if (!raw) return null; try { return JSON.parse(raw)._rev || null; } catch (e) { return null; } }
+function wipeLocal() {
+  const ks = []; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('pl:') && (SYNCED.test(k.slice(3)) || k.startsWith('pl:sync/'))) ks.push(k); } } catch (e) {}
+  for (const k of ks) { try { localStorage.removeItem(k); } catch (e) {} }
+  store.days.clear(); store.evicted.clear(); S.days = {}; reloadStateFromLocal();
+}
+
+// ---------- Sign-in: Google OAuth → Firebase Auth REST (no SDK) ----------
+function readSdkSession() { // sign-ins made by app versions ≤ 1.3 live in the Firebase SDK's IndexedDB
+  return new Promise(res => {
+    let done = false; const finish = v => { if (!done) { done = true; res(v); } };
+    setTimeout(() => finish(null), 3000);
+    if (!window.indexedDB) return finish(null);
+    let req; try { req = indexedDB.open('firebaseLocalStorageDb'); } catch (e) { return finish(null); }
+    req.onupgradeneeded = () => { try { req.transaction.abort(); } catch (e) {} finish(null); }; // didn't exist: don't create it
+    req.onerror = () => finish(null);
+    req.onsuccess = () => {
+      const db = req.result;
+      try {
+        if (!db.objectStoreNames.contains('firebaseLocalStorage')) { db.close(); return finish(null); }
+        const all = db.transaction('firebaseLocalStorage', 'readonly').objectStore('firebaseLocalStorage').getAll();
+        all.onsuccess = () => { db.close(); const rec = (all.result || []).find(r => r && typeof r.fbase_key === 'string' && r.fbase_key.startsWith('firebase:authUser:') && r.value && r.value.uid); finish(rec ? rec.value : null); };
+        all.onerror = () => { db.close(); finish(null); };
+      } catch (e) { try { db.close(); } catch (e2) {} finish(null); }
+    };
+  });
+}
+const auth = {
+  user: null, checked: false, expired: false, refreshing: null,
+  load() { this.user = store.lsGet('auth'); this.checked = !!(this.user || store.raw('auth_checked')); },
+  save() { if (this.user) store.put('auth', JSON.stringify(this.user)); else store.lsDel('auth'); },
+  markChecked() { this.checked = true; store.put('auth_checked', '1'); },
+  begin(user) {
+    const st = store.lsGet('sync/state');
+    if (st && st.uid && st.uid !== user.uid) wipeLocal(); // someone else's diary was on this device
+    this.user = user; this.expired = false; this.save(); this.markChecked();
+  },
+  async token(force) {
+    const u = this.user; if (!u) throw { code: 'auth', message: 'Signed out' };
+    if (!force && u.idToken && u.exp - 120000 > Date.now()) return u.idToken;
+    if (!this.refreshing) this.refreshing = (async () => {
+      let r, j = {};
+      try {
+        r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${API_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(u.refreshToken) });
+        j = await r.json().catch(() => ({}));
+      } catch (e) { throw { code: 'offline', message: 'No connection' }; }
+      if (!r.ok) {
+        const msg = (j.error && j.error.message) || 'HTTP ' + r.status;
+        if (/TOKEN_EXPIRED|INVALID_REFRESH_TOKEN|USER_DISABLED|USER_NOT_FOUND|INVALID_GRANT|MISSING_REFRESH_TOKEN/.test(msg)) { this.expire(); throw { code: 'auth', message: msg }; }
+        throw { code: 'http', message: msg };
+      }
+      if (this.user !== u) throw { code: 'auth', message: 'Signed out' };
+      u.idToken = j.id_token; if (j.refresh_token) u.refreshToken = j.refresh_token; u.exp = Date.now() + (+j.expires_in || 3600) * 1000; this.save();
+      return u.idToken;
+    })().finally(() => { this.refreshing = null; });
+    return this.refreshing;
+  },
+  expire() { this.user = null; this.expired = true; this.save(); sync.set('signedout'); refreshView(); },
+  signIn() {
     const state = uid(); try { localStorage.setItem('pl:oauth_state', state); } catch (e) {}
     const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
     u.searchParams.set('client_id', GOOGLE_CLIENT_ID); u.searchParams.set('redirect_uri', APP_URL); u.searchParams.set('response_type', 'token');
@@ -122,39 +187,305 @@ const cloud = {
     location.href = u.toString();
   },
   async handleOAuthReturn() {
-    if (!location.hash.includes('access_token=')) return false;
-    const p = new URLSearchParams(location.hash.slice(1)); const tok = p.get('access_token'); const st = p.get('state');
+    const p = new URLSearchParams(location.hash.slice(1)); const tok = p.get('access_token'), st = p.get('state');
     let saved = null; try { saved = localStorage.getItem('pl:oauth_state'); localStorage.removeItem('pl:oauth_state'); } catch (e) {}
     history.replaceState(null, '', location.pathname + location.search);
     if (!tok || (saved && st !== saved)) { toast('Sign-in could not be completed — try again'); return false; }
-    try { await this.auth.signInWithCredential(firebase.auth.GoogleAuthProvider.credential(null, tok)); toast('Signed in'); }
-    catch (e) { toast('Sign-in failed: ' + (e.code || e.message)); }
+    try {
+      const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=${API_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ postBody: 'access_token=' + encodeURIComponent(tok) + '&providerId=google.com', requestUri: 'http://localhost', returnSecureToken: true }) }); // same request the Firebase SDK makes
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.idToken) throw new Error((j.error && j.error.message) || 'HTTP ' + r.status);
+      this.begin({ uid: j.localId, email: j.email || '', name: j.displayName || j.fullName || j.email || 'Signed in', idToken: j.idToken, refreshToken: j.refreshToken, exp: Date.now() + (+j.expiresIn || 3600) * 1000 });
+      toast('Signed in'); return true;
+    } catch (e) { toast('Sign-in failed: ' + (e.message || e)); return false; }
+  },
+  async migrateFromSdk() {
+    const v = await readSdkSession(); const t = v && v.stsTokenManager;
+    if (!v || !v.uid || !t || !t.refreshToken) return false;
+    this.begin({ uid: v.uid, email: v.email || '', name: v.displayName || v.email || 'Signed in', idToken: t.accessToken || '', refreshToken: t.refreshToken, exp: +t.expirationTime || 0 });
     return true;
   },
-  async signOut() {
-    if (!this.ready) return;
-    await this.auth.signOut();
-    for (const k of store.allKeys()) { try { localStorage.removeItem(k); } catch (e) {} }
+  signOut() {
+    this.user = null; this.save(); wipeLocal(); this.markChecked();
+    try { indexedDB.deleteDatabase('firebaseLocalStorageDb'); } catch (e) {}
     location.reload();
   }
 };
+
+// ---------- Cloud sync: Firestore REST, incremental by server timestamp, durable upload queue, three-way merge ----------
+function enc(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  switch (typeof v) {
+    case 'boolean': return { booleanValue: v };
+    case 'number': return !isFinite(v) ? { nullValue: null } : Number.isInteger(v) && Math.abs(v) <= Number.MAX_SAFE_INTEGER ? { integerValue: String(v) } : { doubleValue: v };
+    case 'string': return { stringValue: v };
+    case 'object':
+      if (Array.isArray(v)) return { arrayValue: v.length ? { values: v.map(x => Array.isArray(x) ? { mapValue: { fields: { __a: enc(x) } } } : enc(x)) } : {} }; // Firestore can't nest arrays directly
+      return { mapValue: { fields: encFields(v) } };
+  }
+  return { nullValue: null };
+}
+function encFields(o) { const f = {}; for (const k in o) if (o[k] !== undefined && k !== '_u' && k !== '_rev') f[k] = enc(o[k]); return f; }
+function dec(v) {
+  if (!v || typeof v !== 'object') return null;
+  if ('stringValue' in v) return v.stringValue;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue' in v) return Number(v.doubleValue);
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('mapValue' in v) { const f = v.mapValue.fields || {}, ks = Object.keys(f); if (ks.length === 1 && ks[0] === '__a') return dec(f.__a); const o = {}; for (const k of ks) o[k] = dec(f[k]); return o; }
+  if ('arrayValue' in v) return (v.arrayValue.values || []).map(dec);
+  if ('timestampValue' in v) return tsParse(v.timestampValue);
+  return null;
+}
+const tsParse = s => { const t = Date.parse(String(s).replace(/(\.\d{3})\d+/, '$1')); return isFinite(t) ? t : 0; }; // Firestore sends µs; Safari only parses ms
+function canon(v) {
+  if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).filter(k => v[k] !== undefined && k !== '_rev' && k !== '_u').sort().map(k => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+  return JSON.stringify(v === undefined ? null : v);
+}
+const sameVal = (a, b) => canon(a) === canon(b);
+const sameRaw = (raw, obj) => { try { return canon(JSON.parse(raw)) === canon(obj); } catch (e) { return false; } }; // stored JSON text vs a value
+const fsPath = path => path.startsWith('days/') ? 'days/' + path.slice(5) : 'meta/' + path.replace(/\//g, '_');
+function fromDoc(doc) {
+  const parts = doc.name.split('/'), id = parts.pop(), coll = parts.pop();
+  const data = dec({ mapValue: { fields: doc.fields || {} } }) || {}; delete data._u; data._rev = doc.updateTime;
+  return { path: coll === 'days' ? 'days/' + id : META[id] || null, id, coll, data };
+}
+async function fsFetch(url, body, opts = {}) {
+  const payload = body ? JSON.stringify(body) : undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tok = await auth.token(attempt > 0);
+    let r;
+    try { r = await fetch(url, { method: body ? 'POST' : 'GET', headers: body ? { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' } : { Authorization: 'Bearer ' + tok }, body: payload, keepalive: !!(opts.keepalive && payload && payload.length < 60000) }); }
+    catch (e) { throw { code: 'offline', message: 'No connection' }; }
+    if (r.status === 401 && attempt === 0) continue;
+    if (r.status === 404 && opts.allow404) return null;
+    const j = await r.json().catch(() => null);
+    if (!r.ok) {
+      const err = (Array.isArray(j) ? j[0] && j[0].error : j && j.error) || {};
+      const conflict = r.status === 409 || /FAILED_PRECONDITION|ALREADY_EXISTS|ABORTED/.test(err.status || '');
+      throw { code: r.status === 401 ? 'auth' : conflict ? 'conflict' : 'http', status: r.status, message: err.message || err.status || 'HTTP ' + r.status };
+    }
+    return j;
+  }
+}
+async function fsQuery(coll, sinceMs) {
+  const q = { from: [{ collectionId: coll }] };
+  if (sinceMs) q.where = { fieldFilter: { field: { fieldPath: '_u' }, op: 'GREATER_THAN', value: { timestampValue: new Date(sinceMs).toISOString() } } };
+  const res = await fsFetch(`${FS_ROOT}/users/${auth.user.uid}:runQuery`, { structuredQuery: q });
+  let readTime = 0; const docs = [];
+  for (const x of Array.isArray(res) ? res : []) {
+    if (x.error) throw { code: 'http', message: x.error.message || x.error.status };
+    if (x.readTime) readTime = Math.max(readTime, tsParse(x.readTime));
+    if (x.document) docs.push(fromDoc(x.document));
+  }
+  return { docs, readTime };
+}
+function fsCommit(writes, keepalive) {
+  const base = `projects/${PROJECT}/databases/(default)/documents/users/${auth.user.uid}/`;
+  return fsFetch(`${FS_ROOT}:commit`, { writes: writes.map(w => ({ update: { name: base + fsPath(w.path), fields: encFields(w.data) }, updateTransforms: [{ fieldPath: '_u', setToServerValue: 'REQUEST_TIME' }], currentDocument: w.data._rev ? { updateTime: w.data._rev } : { exists: false } })) }, { keepalive });
+}
+const keyOf = x => x && x.id != null ? 'id:' + x.id : canon(x);
+function mergeList(base, local, remote, prefer) { // three-way merge of lists of {id,…}
+  const B = new Map((base || []).map(x => [keyOf(x), x])), R = new Map((remote || []).map(x => [keyOf(x), x]));
+  const out = [], seen = new Set();
+  for (const l of local || []) {
+    const k = keyOf(l); seen.add(k); const r = R.get(k), b = B.get(k);
+    if (r) out.push(b && sameVal(l, b) ? r : b && sameVal(r, b) ? l : prefer(l, r));
+    else if (!b || !sameVal(l, b)) out.push(l); // added here (or edited here after the other device removed it)
+  }
+  for (const r of remote || []) {
+    const k = keyOf(r); if (seen.has(k)) continue; const b = B.get(k);
+    if (!b || !sameVal(r, b)) out.push(r); // added on the other device (or edited there after this one removed it)
+  }
+  return out;
+}
+const newer = (l, r) => (r.ts || 0) > (l.ts || 0) ? r : l;
+function mergeDoc(path, base, local, remote) {
+  if (!remote) return local;
+  const b = base || {};
+  if (path.startsWith('days/')) {
+    const m = { ...remote, ...local };
+    m.entries = mergeList(b.entries, local.entries, remote.entries, newer).sort((x, y) => (x.ts || 0) - (y.ts || 0));
+    m.exercise = mergeList(b.exercise, local.exercise, remote.exercise, l => l);
+    m.weight = sameVal(local.weight ?? null, b.weight ?? null) ? (remote.weight ?? null) : local.weight;
+    return m;
+  }
+  if (path === 'foods/custom' || path === 'foods/meals') return { ...remote, ...local, items: mergeList(b.items, local.items, remote.items, l => l) };
+  if (path === 'foods/recent') return local;
+  const out = {}; // settings & small docs: per field, keep whichever side changed it
+  for (const k of new Set([...Object.keys(remote), ...Object.keys(local)])) out[k] = k in local && !sameVal(local[k] ?? null, b[k] ?? null) ? local[k] : k in remote ? remote[k] : local[k];
+  return out;
+}
+const sync = {
+  status: 'idle', error: '', lastSync: 0, lastPull: 0, subs: new Set(), busy: null, queued: null, retryT: 0, retryMs: 0, pushT: 0,
+  on(fn) { this.subs.add(fn); return () => this.subs.delete(fn); },
+  set(status, error) { this.status = status; this.error = error || ''; for (const fn of [...this.subs]) { try { fn(); } catch (e) {} } },
+  state() { return store.lsGet('sync/state') || {}; },
+  needFull() { const st = this.state(); return !st.v || !auth.user || st.uid !== auth.user.uid || !st.cursor || Date.now() - (st.lastFull || 0) > 7 * 864e5; },
+  everSynced() { const st = this.state(); return !!(st.v && auth.user && st.uid === auth.user.uid); },
+  dirtyMap() { return store.lsGet('sync/dirty') || {}; },
+  pending() { return Object.keys(this.dirtyMap()).length; },
+  saveDirty(d) { store.put('sync/dirty', JSON.stringify(d)); },
+  markDirty(path, prevJson) {
+    const d = this.dirtyMap();
+    if (!(path in d)) { if (prevJson != null) store.put('sync/base/' + path, prevJson); else store.lsDel('sync/base/' + path); } // remember the last shared version
+    d[path] = (d[path] || 0) + 1; this.saveDirty(d);
+    if (auth.user) { clearTimeout(this.pushT); this.pushT = setTimeout(() => this.run({ pull: false }), 700); }
+  },
+  clean(path) { const d = this.dirtyMap(); if (path in d) { delete d[path]; this.saveDirty(d); } try { localStorage.removeItem('pl:sync/base/' + path); } catch (e) {} },
+  async flush(keepalive) {
+    const d = this.dirtyMap(), writes = [];
+    for (const p of Object.keys(d)) {
+      const raw = store.raw(p); let data = null;
+      try { data = raw == null ? null : JSON.parse(raw); } catch (e) {}
+      if (!data || typeof data !== 'object') { this.clean(p); continue; }
+      writes.push({ path: p, data, raw, seq: d[p] });
+    }
+    for (let i = 0; i < writes.length; i += 100) {
+      const chunk = writes.slice(i, i + 100);
+      const res = await fsCommit(chunk, keepalive), results = (res && res.writeResults) || [];
+      const cur = this.dirtyMap();
+      chunk.forEach((w, k) => {
+        if (results[k] && results[k].updateTime) this.setRev(w.path, results[k].updateTime);
+        if (cur[w.path] === w.seq) { delete cur[w.path]; try { localStorage.removeItem('pl:sync/base/' + w.path); } catch (e) {} }
+        else store.put('sync/base/' + w.path, w.raw); // edited again mid-upload: what we sent is the shared version now
+      });
+      this.saveDirty(cur);
+    }
+    return writes.length;
+  },
+  async pull(full) {
+    const st = this.state(), since = full ? 0 : st.cursor || 0;
+    const [days, meta] = await Promise.all([fsQuery('days', since), fsQuery('meta', since)]);
+    let changed = false; const seen = new Set();
+    const docs = meta.docs.concat(days.docs.sort((a, b) => b.id.localeCompare(a.id))); // settings first, then newest days first (matters if space runs out)
+    for (const doc of docs) { if (!doc.path) continue; seen.add(doc.path); if (this.apply(doc.path, doc.data)) changed = true; }
+    if (!since) { // complete listing: anything only on this device gets uploaded
+      const d = this.dirtyMap(); let add = false;
+      for (const k of store.syncedKeys()) if (!seen.has(k) && !(k in d)) { d[k] = 1; add = true; }
+      if (add) this.saveDirty(d);
+    }
+    const rt = days.readTime && meta.readTime ? Math.min(days.readTime, meta.readTime) : 0;
+    store.put('sync/state', JSON.stringify({ v: 2, uid: auth.user.uid, cursor: rt ? rt - 60000 : st.cursor || 0, lastFull: since ? st.lastFull || 0 : Date.now() }));
+    this.lastPull = Date.now();
+    return changed;
+  },
+  setRev(path, rev) {
+    const raw = store.raw(path); if (!raw) return;
+    try { const o = JSON.parse(raw); if (o._rev === rev) return; o._rev = rev; store.put(path, JSON.stringify(o)); } catch (e) { return; }
+    if (path.startsWith('days/') && S.days[path.slice(5)]) S.days[path.slice(5)]._rev = rev;
+  },
+  apply(path, remote) {
+    const localRaw = store.raw(path);
+    if (!(path in this.dirtyMap())) { // nothing pending here: take the cloud's version
+      if (localRaw != null && sameRaw(localRaw, remote)) { this.setRev(path, remote._rev); return false; }
+      this.keep(path, remote); return true;
+    }
+    let local = null, base = null;
+    try { local = localRaw ? JSON.parse(localRaw) : null; } catch (e) {}
+    if (!local) { this.keep(path, remote); this.clean(path); return true; }
+    try { base = JSON.parse(localStorage.getItem('pl:sync/base/' + path) || 'null'); } catch (e) {}
+    if (!base && path === 'settings/main') base = DEFAULTS; // both sides started from the defaults
+    const merged = mergeDoc(path, base, local, remote); merged._rev = remote._rev; const mj = JSON.stringify(merged);
+    store.put('sync/base/' + path, JSON.stringify(remote));
+    let changed = false;
+    if (mj !== localRaw) { this.keep(path, merged, mj); changed = true; }
+    if (sameVal(merged, remote)) this.clean(path);
+    return changed;
+  },
+  keep(path, data, json) {
+    const ok = store.put(path, json || JSON.stringify(data), path.startsWith('days/') ? path.slice(5) : undefined); // an old day from the cloud never pushes out a newer one
+    if (!path.startsWith('days/')) return;
+    const date = path.slice(5);
+    if (!ok) { store.lsDel(path); store.evicted.add(date); store.saveEvicted(); } // no room on this device: the cloud copy is fetched when that day is opened
+    const cur = S.days[date]; if (cur) { for (const k of Object.keys(cur)) delete cur[k]; Object.assign(cur, data); cur.entries = cur.entries || []; cur.exercise = cur.exercise || []; cur.date = date; }
+  },
+  async fetchDay(date) { const j = await fsFetch(`${FS_ROOT}/users/${auth.user.uid}/days/${date}`, null, { allow404: true }); return j ? fromDoc(j).data : null; },
+  run(opts = {}) {
+    if (!auth.user) return Promise.resolve();
+    const want = { pull: opts.pull !== false, full: !!opts.full };
+    if (this.busy) { const q = this.queued || (this.queued = { pull: false, full: false }); q.pull = q.pull || want.pull; q.full = q.full || want.full; return this.busy; }
+    this.busy = (async () => {
+      clearTimeout(this.retryT); clearTimeout(this.pushT);
+      this.set('syncing');
+      try {
+        let changed = false;
+        if (want.pull) changed = await this.pull(want.full || this.needFull());
+        for (let attempt = 0; ; attempt++) {
+          try { await this.flush(opts.keepalive); break; }
+          catch (e) { if (e.code !== 'conflict' || attempt >= 3) throw e; changed = (await this.pull(attempt >= 1 || this.needFull())) || changed; } // another device got there first: merge and retry
+        }
+        this.retryMs = 0; this.lastSync = Date.now(); this.set('synced');
+        if (!store.raw('sync/cleaned')) { store.put('sync/cleaned', '1'); for (const n of ['firestore/[DEFAULT]/plate-ledger-8007d/main', 'firebase-heartbeat-database', 'firebaseLocalStorageDb']) { try { indexedDB.deleteDatabase(n); } catch (e) {} } } // leftovers of the old Firebase SDK
+        if (changed) { reloadStateFromLocal(); refreshView(); }
+      } catch (e) {
+        if (e && e.code === 'auth') this.set('signedout');
+        else {
+          this.set(e && e.code === 'offline' ? 'offline' : 'error', e && e.message);
+          this.retryMs = Math.min(300000, (this.retryMs || 7500) * 2);
+          this.retryT = setTimeout(() => this.run(), this.retryMs);
+        }
+      } finally {
+        this.busy = null;
+        if (this.queued) { const q = this.queued; this.queued = null; this.run(q); }
+      }
+    })();
+    return this.busy;
+  }
+};
+
 function reloadStateFromLocal() {
   const st = store.lsGet('settings/main'); S.settings = st ? { ...DEFAULTS, ...st } : { ...DEFAULTS };
-  const cf = store.lsGet('foods/custom'); S.custom = (cf && cf.items) || []; for (const f of S.custom) f.lc = f.name.toLowerCase();
+  const cf = store.lsGet('foods/custom'); S.custom = (cf && cf.items) || []; for (const f of S.custom) f.lc = String(f.name || '').toLowerCase();
   const rc = store.lsGet('foods/recent'); S.recent = (rc && rc.items) || [];
-  const ml = store.lsGet('foods/meals'); S.meals = (ml && ml.items) || [];
+  const ml = store.lsGet('foods/meals'); S.meals = (ml && ml.items) || []; recipeCache = null;
 }
-function refreshView() { if (document.querySelector('#sheetRoot').children.length) return; ({ today: renderToday, trends: renderTrends, foods: renderFoods, settings: renderSettings })[S.tab || 'today'](); }
+const sheetOpen = () => !!document.querySelector('#sheetRoot').children.length;
+let refreshPending = false;
+function refreshView() {
+  const a = document.activeElement;
+  if (sheetOpen() || (a && a.matches && a.matches('input,textarea,select') && a.closest('.screen'))) { refreshPending = true; return; } // don't yank the screen away mid-edit
+  refreshPending = false;
+  ({ today: renderToday, trends: renderTrends, foods: renderFoods, settings: renderSettings })[S.tab || 'today']();
+}
 // ---------- State ----------
 const DEFAULTS = { kcal: 2200, p: 150, c: 230, f: 75, fib: 30, sug: 50, na: 2300, meals: ['Breakfast', 'Lunch', 'Dinner', 'Snacks'], netMode: false };
 const S = { settings: { ...DEFAULTS }, date: todayStr(), days: {}, custom: [], recent: [], meals: [], tab: 'today', lastWeight: null };
+let recipeCache = null;
 
 const emptyDay = date => ({ date, entries: [], weight: null, exercise: [] });
-async function loadDay(date) {
-  if (!S.days[date]) S.days[date] = (await store.get('days/' + date)) || emptyDay(date);
-  return S.days[date];
+function dayLocal(date) {
+  let d = S.days[date]; if (d) return d;
+  if (!store.days.has(date)) return null;
+  d = store.lsGet('days/' + date); if (!d || typeof d !== 'object') return null;
+  d.entries = d.entries || []; d.exercise = d.exercise || []; d.date = date;
+  return (S.days[date] = d);
 }
-async function saveDay(date) { const d = S.days[date]; d.date = date; await store.set('days/' + date, d); }
+async function loadDay(date) {
+  const d = dayLocal(date); if (d) return d;
+  if (store.evicted.has(date) && auth.user) { // trimmed off this device earlier; fetch it back from the cloud
+    try { const r = await sync.fetchDay(date); if (r) { r.entries = r.entries || []; r.exercise = r.exercise || []; r.date = date; return (S.days[date] = r); } store.evicted.delete(date); store.saveEvicted(); }
+    catch (e) { const stub = emptyDay(date); stub._stub = true; return stub; } // offline: read-only placeholder, not cached
+  }
+  return (S.days[date] = emptyDay(date));
+}
+const rnd = (v, p) => typeof v === 'number' && isFinite(v) ? Math.round(v * p) / p : v;
+const sig3 = v => typeof v === 'number' && isFinite(v) && v !== 0 ? +v.toPrecision(3) : v;
+function compactEntry(e) { // 155.00000000000003 → 155; roughly halves what a diary day takes on disk and on the wire
+  for (const k of ['kcal', 'grams', 'na']) if (k in e) e[k] = rnd(e[k], 10);
+  for (const k of ['p', 'c', 'f', 'fib', 'sug']) if (k in e) e[k] = rnd(e[k], 100);
+  if (typeof e.qty === 'number') e.qty = rnd(e.qty, 1000);
+  if (e.m) for (const k in e.m) e.m[k] = sig3(e.m[k]);
+  for (const k in e) if (e[k] === undefined) delete e[k];
+  return e;
+}
+async function saveDay(date) {
+  const d = S.days[date];
+  if (!d || d._stub) { toast('This day is stored in the cloud — connect to the internet to edit it'); return false; }
+  d.date = date; d.entries = d.entries || []; for (const e of d.entries) compactEntry(e);
+  return store.set('days/' + date, d);
+}
 const totals = day => day.entries.reduce((t, e) => { for (const k of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na']) t[k] += e[k] || 0; return t; }, { kcal: 0, p: 0, c: 0, f: 0, fib: 0, sug: 0, na: 0 });
 const burned = day => (day.exercise || []).reduce((t, x) => t + (x.kcal || 0), 0);
 
@@ -172,30 +503,34 @@ function openSheet(title, body, footer) {
   document.body.style.overflow = 'hidden';
   return sh;
 }
-function closeSheet() { if (openAdd.stop) { openAdd.stop(); openAdd.stop = null; } $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; }
+function closeSheet() { if (openAdd.stop) { openAdd.stop(); openAdd.stop = null; } $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; if (refreshPending) setTimeout(() => { if (refreshPending) refreshView(); }, 0); }
 const field = (label, input) => el('div', { class: 'field' }, el('label', { for: input.id }, label), input);
 
 // ---------- Nutrition helpers ----------
-const scaleFood = (food, grams) => { const k = grams / (food.per || 100); const o = { kcal: food.kcal * k, p: food.p * k, c: food.c * k, f: food.f * k, fib: food.fib * k, sug: food.sug * k, na: food.na * k }; if (food.m) { o.m = {}; for (const key in food.m) o.m[key] = (food.m[key] || 0) * k; } return o; };
+const scaleFood = (food, grams) => { const k = grams / (food.per || 100); const o = { kcal: food.kcal * k, p: food.p * k, c: food.c * k, f: food.f * k, fib: food.fib * k, sug: food.sug * k, na: food.na * k }; const mm = microOf(food); if (mm) { o.m = {}; for (const key in mm) o.m[key] = (mm[key] || 0) * k; } return o; };
 const nutGrid = n => el('div', { class: 'nutgrid' },
   el('span', {}, el('b', {}, r1(n.p) + ' g'), 'Protein'), el('span', {}, el('b', {}, r1(n.c) + ' g'), 'Carbs'),
   el('span', {}, el('b', {}, r1(n.f) + ' g'), 'Fat'), el('span', {}, el('b', {}, r1(n.fib) + ' g'), 'Fibre'),
   el('span', {}, el('b', {}, r1(n.sug) + ' g'), 'Sugar'), el('span', {}, el('b', {}, r0(n.na) + ' mg'), 'Sodium'));
 
 // ---------- Search ----------
-function searchFoods(q) {
+function searchFoods(q, limit = 30) {
   q = q.trim().toLowerCase(); if (!q) return [];
   const toks = q.split(/[\s,]+/).filter(Boolean).map(t => t.length > 3 && t.endsWith('s') ? t.slice(0, -1) : t);
-  const score = f => {
-    let s = 0;
-    for (const t of toks) { const i = f.lc.indexOf(t); if (i < 0) return -1; s += i === 0 ? 30 : (f.lc[i - 1] === ' ' || f.lc[i - 1] === ',' ? 12 : 4); }
-    return s - f.lc.length * 0.08 - (f.lc.split(',').length - 1) * 1.5;
-  };
-  const out = [];
-  for (const f of S.custom) { const s = score(f); if (s >= 0) out.push([s + 50, f]); }
-  for (const f of recipeFoods()) { const s = score(f); if (s >= 0) out.push([s + 50, f]); }
-  for (const f of FOODS) { const s = score(f); if (s >= 0) out.push([s + (f.src === 'cnf' ? 2 : 0), f]); }
-  return out.sort((a, b) => b[0] - a[0]).slice(0, 40).map(x => x[1]);
+  const top = []; // best matches so far, highest score first
+  const offer = (s, x) => { if (top.length === limit && s <= top[limit - 1][0]) return; let i = top.length; while (i > 0 && top[i - 1][0] < s) i--; top.splice(i, 0, [s, x]); if (top.length > limit) top.pop(); };
+  const score = lc => { let s = 0; for (const t of toks) { const i = lc.indexOf(t); if (i < 0) return -1; const p = i ? lc.charCodeAt(i - 1) : 0; s += i === 0 ? 30 : p === 32 || p === 44 ? 12 : 4; } return s; };
+  const commas = lc => { let k = 0, j = -1; while ((j = lc.indexOf(',', j + 1)) >= 0) k++; return k; };
+  for (const f of S.custom) { const lc = f.lc || ''; const s = score(lc); if (s >= 0) offer(s + 50 - lc.length * 0.08 - commas(lc) * 1.5, f); }
+  for (const f of recipeFoods()) { const s = score(f.lc); if (s >= 0) offer(s + 50 - f.lc.length * 0.08 - commas(f.lc) * 1.5, f); }
+  if (DB.ready && q.replace(/[\s,]/g, '').length >= 2) { // one letter matches nearly everything: wait for the second
+    const { lc, nc, src } = DB, prev = searchFoods.last, hits = [];
+    const visit = i => { const s = score(lc[i]); if (s >= 0) { hits.push(i); offer(s - lc[i].length * 0.08 - nc[i] * 1.5 + (src[i] ? 0 : 2), i); } };
+    if (prev && prev.rows === DB.rows && q.startsWith(prev.q)) { for (const i of prev.hits) visit(i); } // typing more only narrows the matches
+    else for (let i = 0; i < lc.length; i++) visit(i);
+    searchFoods.last = { q, rows: DB.rows, hits: Int32Array.from(hits) };
+  }
+  return top.map(x => typeof x[1] === 'number' ? foodFromRow(x[1]) : x[1]);
 }
 
 // ---------- Today screen ----------
@@ -203,8 +538,8 @@ function ringSvg(pct, over) {
   const r = 44, C = 2 * Math.PI * r, p = Math.min(pct, 1);
   return el('div', { class: 'ring', html:
     `<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="${r}" fill="none" stroke="var(--surface2)" stroke-width="9"/>
-     <circle cx="50" cy="50" r="${r}" fill="none" stroke="${over ? 'var(--over)' : 'var(--accent)'}" stroke-width="9" stroke-linecap="round"
-       stroke-dasharray="${(C * p).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 50 50)"/></svg>` });
+     ${p > 0 ? `<circle cx="50" cy="50" r="${r}" fill="none" stroke="${over ? 'var(--over)' : 'var(--accent)'}" stroke-width="9" stroke-linecap="round"
+       stroke-dasharray="${(C * p).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 50 50)"/>` : ''}</svg>` });
 }
 function macroRow(cls, label, val, target, unit = 'g') {
   const pct = target ? Math.min(val / target, 1) * 100 : 0;
@@ -212,8 +547,9 @@ function macroRow(cls, label, val, target, unit = 'g') {
     el('div', { class: 'lbl' }, el('span', {}, label), el('b', {}, r0(val) + ' / ' + target + ' ' + unit)),
     el('div', { class: 'bar' }, el('i', { class: val > target ? 'over' : '', style: 'width:' + pct + '%' })));
 }
+const renderGen = { today: 0, trends: 0 };
 async function renderToday() {
-  const root = $('#scr-today'); root.innerHTML = '';
+  const gen = ++renderGen.today; const root = document.createDocumentFragment(); S.shownToday = S.date === todayStr();
   const day = await loadDay(S.date); const t = totals(day); const st = S.settings;
   const goal = st.kcal + (st.netMode ? burned(day) : 0);
   const left = goal - t.kcal;
@@ -227,9 +563,10 @@ async function renderToday() {
       el('div', { class: 'mini' }, el('b', {}, r0(t.sug) + ' / ' + st.sug + ' g'), 'Sugar'),
       el('div', { class: 'mini' }, el('b', {}, r0(t.na) + ' / ' + st.na + ' mg'), 'Sodium')),
     el('div', { class: 'chips', style: 'margin-top:10px' }, el('button', { class: 'chip', onclick: () => suggestMeal(guessMeal()) }, '✨ What should I eat?')));
-  if (cloud.ready && !cloud.user) root.append(el('div', { class: 'card', style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
-    el('div', { style: 'flex:1;min-width:200px' }, el('strong', {}, 'Not backed up yet'), el('div', { class: 'hint' }, 'Sign in with Google to keep your diary safe and use it on any device.')),
-    el('button', { class: 'btn', style: 'flex:0 0 auto', onclick: () => cloud.signIn() }, 'Sign in with Google')));
+  if (auth.checked && !auth.user) root.append(el('div', { class: 'card', style: 'display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap' },
+    el('div', { style: 'flex:1;min-width:200px' }, el('strong', {}, auth.expired ? 'Signed out' : 'Not backed up yet'), el('div', { class: 'hint' }, auth.expired ? 'Sign in again to keep your diary syncing — nothing on this device is lost.' : 'Sign in with Google to keep your diary safe and use it on any device.')),
+    el('button', { class: 'btn', style: 'flex:0 0 auto', onclick: () => auth.signIn() }, 'Sign in with Google')));
+  if (day._stub) root.append(el('div', { class: 'warn' }, 'This day is saved in the cloud but couldn’t be loaded — connect to the internet to see or edit it.'));
   root.append(sum);
   root.append(weekCard(await weekBudget(S.date)));
   for (const meal of st.meals) {
@@ -249,7 +586,7 @@ async function renderToday() {
   }
   root.append(nutrientsCard(day));
   // weight & exercise
-  const wtr = weightTrend((await store.recentDays(60)).filter(d => d.weight).sort((a, b) => a.date.localeCompare(b.date)));
+  const wtr = weightTrend(store.recentDays(60).filter(d => d.weight).sort((a, b) => a.date.localeCompare(b.date)));
   const wx = el('div', { class: 'card stack' },
     el('div', { class: 'section-h' }, el('h2', {}, 'Weight & activity'), el('span', { class: 'hint' }, day.weight ? day.weight + ' kg' : 'no weigh-in')),
     wtr ? el('div', { class: 'hint' }, wtr.text) : null,
@@ -264,6 +601,8 @@ async function renderToday() {
     if (st.netMode) wx.append(el('div', { class: 'hint' }, `Net goal today: ${r0(goal)} kcal (target + ${r0(burned(day))} burned)`));
   }
   root.append(wx);
+  if (gen !== renderGen.today) return;
+  $('#scr-today').replaceChildren(root);
   $('#dateLabel').textContent = fmtDate(S.date);
 }
 
@@ -280,15 +619,25 @@ function openAdd(meal, mode = 'search', prefill = null) {
   setMode(mode);
 }
 function viewSearch(meal, onPick) {
-  const inp = el('input', { id: 'q', placeholder: 'Search 14,000 foods… e.g. chicken breast grilled', autocomplete: 'off' });
+  const inp = el('input', { id: 'q', placeholder: 'Search 14,000 foods… e.g. chicken breast grilled', autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'search' });
   const res = el('div', { class: 'results' });
-  const show = list => { res.innerHTML = ''; for (const f of list) res.append(resRow(f, meal, onPick)); };
-  inp.addEventListener('input', () => show(searchFoods(inp.value)));
+  let seq = 0, frame = 0;
+  const show = async () => {
+    frame = 0; const my = ++seq, q = inp.value;
+    if (q.trim() && !DB.ready) { res.replaceChildren(el('div', { class: 'hint' }, 'Loading the food database…')); await loadFoods(); if (my !== seq) return; }
+    const list = searchFoods(q);
+    res.replaceChildren(...list.map(f => resRow(f, meal, onPick)));
+    if (q.trim() && !list.length) res.append(el('div', { class: 'empty' }, 'No matches — try fewer or shorter words, or add it under Quick add.'));
+  };
+  inp.addEventListener('input', () => { if (!frame) frame = requestAnimationFrame(show); });
+  loadFoods();
   setTimeout(() => inp.focus(), 50);
   const wrap = el('div', { class: 'stack' }, el('div', { class: 'search' }, inp));
-  if (S.recent.length) { wrap.append(el('div', { class: 'hint' }, 'Recent')); const rr = el('div', { class: 'results' }); for (const f of S.recent.slice(0, 12)) rr.append(resRow(f, meal, onPick)); wrap.append(rr); }
-  else wrap.append(el('div', { class: 'hint' }, 'Canadian Nutrient File (Health Canada) and USDA foods, plus your own. Packaged products: snap the Nutrition Facts label under Photo, or save them once under Foods.'));
-  wrap.append(res);
+  const intro = el('div', { class: 'stack', style: 'gap:6px' }); // recent foods until you start typing
+  if (S.recent.length) { intro.append(el('div', { class: 'hint' }, 'Recent')); const rr = el('div', { class: 'results' }); for (const f of S.recent.slice(0, 12)) rr.append(resRow(f, meal, onPick)); intro.append(rr); }
+  else intro.append(el('div', { class: 'hint' }, 'Canadian Nutrient File (Health Canada) and USDA foods, plus your own. Packaged products: scan the barcode, snap the Nutrition Facts label under Photo, or save them once under Foods.'));
+  inp.addEventListener('input', () => { intro.hidden = !!inp.value.trim(); });
+  wrap.append(intro, res);
   return wrap;
 }
 function resRow(f, meal, onPick) {
@@ -392,7 +741,9 @@ function estimateView(meal, { withPhoto }) {
   async function run() {
     if (!withPhoto && !note.value.trim()) { note.focus(); return; }
     ctl = new AbortController(); go.disabled = true; stop.hidden = false; out.innerHTML = '';
-    status.innerHTML = ''; status.append(el('span', { class: 'spin' }), 'Claude is looking at ' + (withPhoto ? 'the photo…' : 'your description…'));
+    const what = withPhoto ? 'the photo' : 'your description', label = el('span', {}, 'Claude is looking at ' + what + '…'), t0 = Date.now();
+    status.innerHTML = ''; status.append(el('span', { class: 'spin' }), label);
+    const tick = setInterval(() => { const sec = Math.round((Date.now() - t0) / 1000); if (sec >= 3) label.textContent = `Claude is looking at ${what}… ${sec} s`; }, 1000);
     try {
       const data = await askClaude(EST_PROMPT(note.value.trim()), withPhoto ? blob : null, ctl.signal);
       const items = Array.isArray(data?.items) ? data.items : [];
@@ -402,7 +753,7 @@ function estimateView(meal, { withPhoto }) {
     } catch (e) {
       status.innerHTML = ''; status.append(AI_ERR[e.code] || ('Something went wrong (' + (e.message || e.code || 'error') + '). Try again.'));
       if (e.code === 'no_key' || e.code === 'bad_key') status.append(' ', el('button', { class: 'chip', onclick: () => { closeSheet(); showTab('settings'); } }, 'Open Settings'));
-    } finally { go.disabled = false; stop.hidden = true; }
+    } finally { clearInterval(tick); go.disabled = false; stop.hidden = true; }
   }
   return wrap;
 }
@@ -433,10 +784,10 @@ function reviewEstimate(items, meal, src) {
 }
 async function downscale(file) {
   try {
-    const bmp = await createImageBitmap(file); const max = 1400; const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const bmp = await createImageBitmap(file); const max = 1024; /* plenty for portions and labels; about half the upload of 1400 px */ const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
     const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-    return await new Promise(res => c.toBlob(b => res(b || file), 'image/jpeg', 0.88));
+    return await new Promise(res => c.toBlob(b => res(b || file), 'image/jpeg', 0.82));
   } catch (e) { return file; }
 }
 
@@ -467,11 +818,11 @@ function renderFoods() {
     el('div', { class: 'hint' }, 'Packaged products, recipes and restaurant items you eat often. They show first in search.'),
     el('button', { class: 'btn', onclick: () => { const form = foodForm(); openSheet('New food', form, el('button', { class: 'btn', onclick: async () => { await saveCustom(form.read()); closeSheet(); renderFoods(); toast('Saved'); } }, 'Save food')); } }, '+ New food'));
   const list = el('div', { class: 'list' });
-  for (const f of S.custom) list.append(el('div', { class: 'li' }, el('button', { class: 'entry', style: 'padding:0;border:0', onclick: () => { const form = foodForm(f); openSheet('Edit food', form, [el('button', { class: 'btn danger', onclick: async () => { S.custom = S.custom.filter(x => x.id !== f.id); await store.set('foods/custom', { items: S.custom }); closeSheet(); renderFoods(); } }, 'Delete'), el('button', { class: 'btn', onclick: async () => { await saveCustom(form.read()); closeSheet(); renderFoods(); toast('Saved'); } }, 'Save')]); } },
+  for (const f of S.custom) list.append(el('div', { class: 'li' }, el('button', { class: 'entry', style: 'padding:0;border:0', onclick: () => { const form = foodForm(f); openSheet('Edit food', form, [el('button', { class: 'btn danger', onclick: async () => { S.custom = S.custom.filter(x => x.id !== f.id); await store.set('foods/custom', { items: S.custom.map(x => ({ ...x, lc: undefined })) }); closeSheet(); renderFoods(); } }, 'Delete'), el('button', { class: 'btn', onclick: async () => { await saveCustom(form.read()); closeSheet(); renderFoods(); toast('Saved'); } }, 'Save')]); } },
     el('div', { class: 'n' }, f.name), el('div', { class: 'd' }, `${r0(f.kcal)} kcal per ${f.per} g · P ${r1(f.p)} · C ${r1(f.c)} · F ${r1(f.f)}`))));
   if (!S.custom.length) list.append(el('div', { class: 'empty' }, 'No saved foods yet.'));
   card.append(list); root.append(mealsCard()); root.append(card);
-  root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Built-in database'), el('div', { class: 'hint' }, `${CNF.length.toLocaleString()} foods from Health Canada's Canadian Nutrient File (2026) and ${USDA.length.toLocaleString()} from the USDA National Nutrient Database (SR28), per 100 g with common serving sizes. CNF entries rank first in search. Packaged products are best added from their label — snap it under Photo, or save it here.`)));
+  root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Built-in database'), el('div', { class: 'hint' }, `${DB.ready ? DB.count[0].toLocaleString() : 'About 5,900'} foods from Health Canada's Canadian Nutrient File (2026) and ${DB.ready ? DB.count[1].toLocaleString() : '8,400'} from the USDA National Nutrient Database (SR28), per 100 g with common serving sizes. CNF entries rank first in search. Packaged products are best added from their label — snap it under Photo, or save it here.`)));
 }
 
 // ---------- Barcode scanning (Open Food Facts) ----------
@@ -535,10 +886,11 @@ function viewScan(meal) {
 }
 
 // ---------- Saved meals & recipes ----------
-async function saveMeals() { await store.set('foods/meals', { items: S.meals.map(m => ({ ...m, items: m.items.map(i => ({ ...i, lc: undefined })) })) }); }
+async function saveMeals() { recipeCache = null; await store.set('foods/meals', { items: S.meals.map(m => ({ ...m, items: m.items.map(i => ({ ...i, lc: undefined })) })) }); }
 const sumItems = items => items.reduce((t, e) => { for (const k of ['kcal', 'p', 'c', 'f', 'fib', 'sug', 'na']) t[k] += e[k] || 0; t.grams += e.grams || 0; if (e.m) { t.m = t.m || {}; for (const k in e.m) t.m[k] = (t.m[k] || 0) + (e.m[k] || 0); } return t; }, { kcal: 0, p: 0, c: 0, f: 0, fib: 0, sug: 0, na: 0, grams: 0 });
 function recipeFoods() {
-  return S.meals.filter(m => m.type === 'recipe').map(m => { const t = sumItems(m.items); const sv = Math.max(1, m.servings || 1); const per = Math.round(t.grams / sv) || 100;
+  if (recipeCache) return recipeCache;
+  return recipeCache = S.meals.filter(m => m.type === 'recipe').map(m => { const t = sumItems(m.items); const sv = Math.max(1, m.servings || 1); const per = Math.round(t.grams / sv) || 100;
     return { id: 'r' + m.id, name: m.name, per, kcal: t.kcal / sv, p: t.p / sv, c: t.c / sv, f: t.f / sv, fib: t.fib / sv, sug: t.sug / sv, na: t.na / sv, m: t.m ? Object.fromEntries(Object.entries(t.m).map(([k, v]) => [k, v / sv])) : undefined, servings: [['serving', per]], src: 'recipe', lc: m.name.toLowerCase(), group: 'Recipe' }; });
 }
 const stripEntry = e => ({ name: e.name, foodId: e.foodId || null, qty: e.qty, unitLabel: e.unitLabel, grams: e.grams, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib || 0, sug: e.sug || 0, na: e.na || 0, src: e.src || 'usda', m: e.m || undefined });
@@ -616,8 +968,10 @@ function mealsCard() {
 }
 
 // ---------- Weight trend & target calculator ----------
-function movingAvg(weights) {
-  return weights.map(w => { const t = new Date(w.date).getTime(); const win = weights.filter(x => { const d = (t - new Date(x.date).getTime()) / 864e5; return d >= 0 && d < 7; }); return { date: w.date, avg: win.reduce((a, x) => a + x.weight, 0) / win.length }; });
+function movingAvg(weights) { // 7-day trailing average; weights sorted oldest first
+  const ts = weights.map(w => Date.parse(w.date)), out = []; let j = 0, sum = 0;
+  for (let i = 0; i < weights.length; i++) { sum += weights[i].weight; while (ts[i] - ts[j] >= 7 * 864e5) sum -= weights[j++].weight; out.push({ date: weights[i].date, avg: sum / (i - j + 1) }); }
+  return out;
 }
 function weightTrend(weights) {
   if (weights.length < 4) return null;
@@ -746,7 +1100,7 @@ async function adaptiveCard() {
 async function maybeAutoAdjust() {
   const st = S.settings; if (!st.autoAdjust) return; if (st.lastAdjust && addDays(st.lastAdjust, 7) > todayStr()) return;
   const est = await expenditureEstimate(); if (!est.ok) return; const old = st.kcal; const plan = await applyAdaptive(est, true);
-  if (plan.kcal !== old) toast(`Weekly check-in: target ${old} → ${plan.kcal} kcal (burn ≈ ${est.tdee})`); refreshView();
+  if (plan.kcal !== old) { toast(`Weekly check-in: target ${old} → ${plan.kcal} kcal (burn ≈ ${est.tdee})`); refreshView(); }
 }
 
 // ---------- Voice input ----------
@@ -825,7 +1179,7 @@ async function handleHealthUrl() {
   let date = kv.date && /^\d{4}-\d{2}-\d{2}$/.test(kv.date) ? kv.date : todayStr(); const day = await loadDay(date); const done = [];
   const w = parseFloat(kv.weight); if (w > 20 && w < 400) { day.weight = Math.round(w * 10) / 10; done.push(day.weight + ' kg'); }
   const a = parseFloat(kv.active); if (a > 0 && a < 6000) { day.exercise = (day.exercise || []).filter(x => x.src !== 'health'); day.exercise.push({ id: uid(), name: 'Apple Health · active energy' + (kv.steps ? ` · ${parseInt(kv.steps).toLocaleString()} steps` : ''), min: 0, kcal: Math.round(a), src: 'health' }); done.push(Math.round(a) + ' kcal active'); }
-  if (done.length) { await saveDay(date); S.date = date; toast('From Apple Health (' + fmtDate(date) + '): ' + done.join(', ')); }
+  if (done.length) { await saveDay(date); toast('From Apple Health (' + fmtDate(date) + '): ' + done.join(', ')); }
   return true;
 }
 function healthCard() {
@@ -836,14 +1190,14 @@ function healthCard() {
     el('div', {}, el('b', {}, 'Plate Ledger → Health'), el('div', { class: 'hint' }, 'Tap the button below (or open ', code(APP_URL + '#tohealth'), ' from a nightly Shortcut automation). It hands yesterday’s totals to a Shortcut named “', HEALTH_SHORTCUT, '”, which logs Dietary Energy, Protein, Carbs, Fat, Fibre, Sugar and Sodium into Health.')),
     el('div', { class: 'row' }, el('button', { class: 'btn ghost', onclick: () => sendDayToHealth(S.date) }, 'Send ' + fmtDate(S.date) + ' to Health'), el('button', { class: 'btn ghost', onclick: () => sendDayToHealth(addDays(todayStr(), -1)) }, 'Send yesterday')),
     el('div', {}, el('b', {}, 'Health → Plate Ledger'), el('div', { class: 'hint' }, 'A morning Shortcut automation opens a link like the one below with your latest weight and yesterday’s active calories; the app files them into that day.')),
-    el('div', { class: 'row' }, el('input', { readonly: '', value: url, style: 'flex:1;font-size:12px' }), el('button', { class: 'btn ghost', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url).then(() => toast('Copied')); } }, 'Copy')),
+    el('div', { class: 'row', style: 'align-items:center' }, el('code', { style: 'flex:1;font-size:12px;overflow-wrap:anywhere;user-select:all' }, url), el('button', { class: 'btn ghost', style: 'flex:0 0 auto', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url).then(() => toast('Copied')); } }, 'Copy')),
     el('div', { class: 'hint' }, 'Because Shortcuts opens links in Safari rather than the home-screen app, sign in with Google in Safari once too — the cloud keeps both in sync.'));
 }
 
 // ---------- Entry edit ----------
 function openEntry(e) {
-  const food = { id: e.foodId, name: e.name, per: e.grams, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib, sug: e.sug, na: e.na, servings: e.unitLabel !== 'g' ? [[e.unitLabel, e.grams / (e.qty || 1)]] : [], src: e.src };
-  const base = S.custom.find(f => f.id === e.foodId) || FOODS.find(f => f.id === e.foodId) || food;
+  const food = { id: e.foodId, name: e.name, per: e.grams || 100, kcal: e.kcal, p: e.p, c: e.c, f: e.f, fib: e.fib, sug: e.sug, na: e.na, m: e.m, servings: e.unitLabel !== 'g' ? [[e.unitLabel, e.grams / (e.qty || 1)]] : [], src: e.src };
+  const base = S.custom.find(f => f.id === e.foodId) || foodById(e.foodId) || food;
   const day = S.days[S.date];
   const del = el('button', { class: 'btn danger', onclick: async () => { day.entries = day.entries.filter(x => x.id !== e.id); await saveDay(S.date); closeSheet(); renderToday(); toast('Removed'); } }, 'Delete');
   openQuantity(base, e.meal, e);
@@ -870,8 +1224,8 @@ function openExercise(day) {
 
 // ---------- Trends ----------
 async function renderTrends() {
-  const root = $('#scr-trends'); root.innerHTML = '';
-  const days = await store.recentDays(90); const byDate = {}; for (const d of days) byDate[d.date] = d;
+  const gen = ++renderGen.trends; const root = document.createDocumentFragment();
+  const days = store.recentDays(90); const byDate = {}; for (const d of days) byDate[d.date] = d;
   const t = todayStr(); const st = S.settings;
   const last14 = []; for (let i = 13; i >= 0; i--) { const ds = addDays(t, -i); const d = byDate[ds]; last14.push({ ds, kcal: d ? totals(d).kcal : 0, logged: !!(d && d.entries.length) }); }
   const logged = last14.filter(x => x.logged); const avg = logged.length ? logged.reduce((a, x) => a + x.kcal, 0) / logged.length : 0;
@@ -920,6 +1274,8 @@ async function renderTrends() {
       el('div', { class: 'bar', style: 'height:14px;display:flex' }, el('i', { style: `width:${m.p * 4 / kc * 100}%;background:var(--p);border-radius:0` }), el('i', { style: `width:${m.c * 4 / kc * 100}%;background:var(--c);border-radius:0` }), el('i', { style: `width:${m.f * 9 / kc * 100}%;background:var(--f);border-radius:0` })),
       el('div', { class: 'legend' }, el('span', {}, el('i', { style: 'background:var(--p)' }), `Protein ${r0(m.p * 4 / kc * 100)}%`), el('span', {}, el('i', { style: 'background:var(--c)' }), `Carbs ${r0(m.c * 4 / kc * 100)}%`), el('span', {}, el('i', { style: 'background:var(--f)' }), `Fat ${r0(m.f * 9 / kc * 100)}%`))));
   }
+  if (gen !== renderGen.trends) return;
+  $('#scr-trends').replaceChildren(root);
 }
 
 function microWeekCard(days) {
@@ -952,46 +1308,65 @@ function renderSettings() {
   const key = el('input', { id: 'apiKey', type: 'password', autocomplete: 'off', placeholder: 'sk-ant-…', value: st.apiKey || '' });
   const show = el('button', { class: 'chip', onclick: () => { key.type = key.type === 'password' ? 'text' : 'password'; show.textContent = key.type === 'password' ? 'Show' : 'Hide'; } }, 'Show');
   const model = el('select', { id: 'model' }); MODELS.forEach(([v, l]) => model.append(el('option', { value: v, selected: (st.model || MODELS[0][0]) === v ? '' : null }, l)));
-  const keyStatus = el('div', { class: 'hint' }, st.apiKey ? 'Key saved on this device only.' : 'No key yet.');
+  const keyStatus = el('div', { class: 'hint' }, st.apiKey ? (auth.user ? 'Key saved to your account (private to you) — it works on all your signed-in devices.' : 'Key saved on this device.') : 'No key yet.');
   const saveKey = el('button', { class: 'btn', onclick: async () => { st.apiKey = key.value.trim(); st.model = model.value; await save(); keyStatus.textContent = 'Testing the key…'; try { const r = await askClaude('Reply with only this JSON: {"ok":true}', null); keyStatus.textContent = r && r.ok ? 'Key works — photo and text estimates are on.' : 'Key saved; unexpected reply, but the request went through.'; } catch (e) { keyStatus.textContent = AI_ERR[e.code] || ('Could not verify: ' + (e.message || e.code)); } } }, 'Save & test');
   root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Claude (photo & text estimates)'),
     el('div', { class: 'hint' }, 'Estimates call the Anthropic API directly from this device with your own key. Get one at console.anthropic.com → API keys; add a few dollars of credit. A photo estimate costs roughly 1–3 ¢.'),
     field('Anthropic API key', key), el('div', { class: 'chips' }, show), field('Model', model), saveKey, keyStatus));
   // Data
   const imp = el('input', { type: 'file', accept: 'application/json', hidden: '' });
-  imp.onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const j = JSON.parse(await f.text()); let n = 0; for (const [k, v] of Object.entries(j)) if (k.startsWith('pl:')) { localStorage.setItem(k, JSON.stringify(v)); n++; } toast('Restored ' + n + ' records'); location.reload(); } catch (err) { toast('That file is not a Plate Ledger backup'); } };
+  imp.onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const j = JSON.parse(await f.text()); let n = 0;
+      for (const [k, v] of Object.entries(j)) {
+        const path = k.slice(3); if (!k.startsWith('pl:') || !SYNCED.test(path) || !v || typeof v !== 'object') continue;
+        if (path === 'settings/main' && !v.apiKey && S.settings.apiKey) v.apiKey = S.settings.apiKey; // backups never contain the key
+        if (store.set(path, v)) n++;
+      }
+      S.days = {}; reloadStateFromLocal(); toast('Restored ' + n + ' records'); refreshView();
+    } catch (err) { toast('That file is not a Plate Ledger backup'); }
+  };
   root.append(el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Data'),
-    el('div', { class: 'hint' }, cloud.user ? 'Your diary is saved to your Google account (private to you) and cached on this device. Backups are optional now.' : 'Until you sign in, your diary lives only in this browser on this device — clearing website data would erase it.'),
+    el('div', { class: 'hint' }, auth.user ? 'Your diary is saved to your Google account (private to you) and kept on this device for speed and offline use. Backups are optional now.' : 'Until you sign in, your diary lives only in this browser on this device — clearing website data would erase it.'),
     el('div', { class: 'row' }, el('button', { class: 'btn ghost', onclick: exportCsv }, 'Export CSV'), el('button', { class: 'btn ghost', onclick: exportBackup }, 'Backup (JSON)')),
     el('button', { class: 'btn ghost', onclick: () => imp.click() }, 'Restore from backup'), imp,
-    el('div', { class: 'hint' }, `Food database: ${CNF.length.toLocaleString()} Canadian Nutrient File + ${USDA.length.toLocaleString()} USDA foods. Version ${APP_VERSION}.`)));
+    el('div', { class: 'hint' }, `Food database: ${DB.ready ? DB.count[0].toLocaleString() + ' Canadian Nutrient File + ' + DB.count[1].toLocaleString() + ' USDA foods' : 'loading in the background'}. On this device: ${(store.usage() / 1048576).toFixed(1)} MB. Version ${APP_VERSION} (build ${BUILD.slice(0, 7)}).`)));
   root.append(healthCard());
 }
 function accountCard() {
   const c = el('div', { class: 'card stack' }, el('h2', { style: 'font-size:16px' }, 'Cloud sync'));
-  if (!cloud.ready) { c.append(el('div', { class: 'hint' }, 'Cloud sync is not available in this view (offline or blocked). Your data is still saved on this device.')); return c; }
-  if (!cloud.user) {
-    c.append(el('div', { class: 'hint' }, 'Sign in with your Google account to keep your diary safe and synced across your phone and computer. Nobody else can see your data.'),
-      el('button', { class: 'btn', onclick: () => cloud.signIn() }, 'Sign in with Google'));
-  } else {
-    const st = el('div', { class: 'hint' });
-    const paint = () => { st.textContent = cloud.status === 'syncing' ? 'Syncing…' : cloud.status === 'error' ? 'Sync problem: ' + (cloud.error || 'unknown') + ' — data is still saved on this device.' : cloud.lastSync ? 'Synced ' + new Date(cloud.lastSync).toLocaleTimeString('en-CA', { hour: 'numeric', minute: '2-digit' }) : 'Synced'; };
-    paint(); cloud.onChange(paint);
-    c.append(el('div', {}, el('strong', {}, cloud.user.displayName || cloud.user.email), el('div', { class: 'hint' }, cloud.user.email)), st,
-      el('button', { class: 'btn ghost', onclick: () => { if (confirm('Sign out? Your diary stays safe in your Google account, but will be removed from this device until you sign in again.')) cloud.signOut(); } }, 'Sign out'));
+  if (!auth.user) {
+    c.append(el('div', { class: 'hint' }, auth.expired ? 'You were signed out. Sign in again to keep syncing — everything on this device is kept.' : 'Sign in with your Google account to keep your diary safe and synced across your phone and computer. Nobody else can see your data.'),
+      el('button', { class: 'btn', onclick: () => auth.signIn() }, 'Sign in with Google'));
+    return c;
   }
+  const line = el('div', { class: 'hint' });
+  const plural = n => n + ' change' + (n === 1 ? '' : 's');
+  const paint = () => {
+    const n = sync.pending(), s = sync.status;
+    line.textContent = s === 'syncing' ? 'Syncing…'
+      : s === 'offline' ? (n ? `Offline — ${plural(n)} will upload when you’re back online.` : 'Offline — everything is saved on this device.')
+      : s === 'error' ? `Sync problem: ${sync.error || 'unknown'}. Your data is safe on this device${n ? ` (${plural(n)} waiting)` : ''}.`
+      : n ? `${plural(n)} waiting to upload…` : sync.lastSync ? 'Synced ' + new Date(sync.lastSync).toLocaleTimeString('en-CA', { hour: 'numeric', minute: '2-digit' }) : 'Up to date';
+  };
+  paint(); const off = sync.on(() => { if (!line.isConnected) { off(); return; } paint(); });
+  c.append(el('div', {}, el('strong', {}, auth.user.name || auth.user.email), el('div', { class: 'hint' }, auth.user.email)), line,
+    el('div', { class: 'row' },
+      el('button', { class: 'btn ghost', onclick: () => sync.run({ full: true }) }, 'Sync now'),
+      el('button', { class: 'btn ghost', onclick: () => { const n = sync.pending(); if (confirm((n ? `${plural(n)} haven’t uploaded yet and will be lost. ` : '') + 'Sign out? Your diary stays safe in your Google account and is removed from this device until you sign in again.')) auth.signOut(); } }, 'Sign out')));
   return c;
 }
 function downloadText(filename, text, type) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = filename; document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
 async function exportCsv() {
-  const days = await store.recentDays(5000); const rows = [['date', 'meal', 'food', 'qty', 'unit', 'grams', 'kcal', 'protein_g', 'carbs_g', 'fat_g', 'fibre_g', 'sugar_g', 'sodium_mg', 'source']];
-  for (const d of days.sort((a, b) => a.date.localeCompare(b.date))) { for (const e of d.entries) rows.push([d.date, e.meal, e.name, e.qty, e.unitLabel, r0(e.grams), r0(e.kcal), r1(e.p), r1(e.c), r1(e.f), r1(e.fib), r1(e.sug), r0(e.na), e.src]); if (d.weight) rows.push([d.date, 'weight', '', d.weight, 'kg', '', '', '', '', '', '', '', '', '']); for (const x of d.exercise || []) rows.push([d.date, 'activity', x.name, x.min, 'min', '', -r0(x.kcal), '', '', '', '', '', '', '']); }
+  const days = await store.allDays(); const rows = [['date', 'meal', 'food', 'qty', 'unit', 'grams', 'kcal', 'protein_g', 'carbs_g', 'fat_g', 'fibre_g', 'sugar_g', 'sodium_mg', 'source']];
+  for (const d of days) { for (const e of d.entries || []) rows.push([d.date, e.meal, e.name, e.qty, e.unitLabel, r0(e.grams), r0(e.kcal), r1(e.p), r1(e.c), r1(e.f), r1(e.fib), r1(e.sug), r0(e.na), e.src]); if (d.weight) rows.push([d.date, 'weight', '', d.weight, 'kg', '', '', '', '', '', '', '', '', '']); for (const x of d.exercise || []) rows.push([d.date, 'activity', x.name, x.min, 'min', '', -r0(x.kcal), '', '', '', '', '', '', '']); }
   downloadText('plate-ledger-' + todayStr() + '.csv', rows.map(r => r.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\n'), 'text/csv');
 }
 function exportBackup() {
-  const j = {}; for (const k of store.allKeys()) { try { j[k] = JSON.parse(localStorage.getItem(k)); } catch (e) {} }
+  const j = {}; for (const k of store.allKeys()) { try { j[k] = JSON.parse(localStorage.getItem(k)); delete j[k]._rev; } catch (e) {} }
   if (j['pl:settings/main']) { j['pl:settings/main'] = { ...j['pl:settings/main'], apiKey: '' }; }
   downloadText('plate-ledger-backup-' + todayStr() + '.json', JSON.stringify(j), 'application/json');
 }
@@ -1010,16 +1385,60 @@ $('#nextDay').onclick = () => { S.date = addDays(S.date, 1); renderToday(); };
 $('#dateLabel').onclick = () => { const i = el('input', { id: 'dp', type: 'date', value: S.date }); openSheet('Go to date', field('Date', i), [el('button', { class: 'btn ghost', onclick: () => { S.date = todayStr(); closeSheet(); renderToday(); } }, 'Today'), el('button', { class: 'btn', onclick: () => { if (i.value) S.date = i.value; closeSheet(); renderToday(); } }, 'Go')]); };
 
 // ---------- Boot ----------
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.4.0', BUILD = '__BUILD__';
+function reloadForUpdate() { if (S.reloading) return; S.reloading = true; location.reload(); }
+function registerSW() {
+  if (!('serviceWorker' in navigator) || !location.protocol.startsWith('http')) return;
+  const had = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!had || S.reloading) return; // first install: this page is already current
+    S.updateReady = true;
+    if (performance.now() < 15000 && !sheetOpen()) reloadForUpdate(); // just opened: swap to the new version now; otherwise when the app is next hidden
+  });
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+  }).catch(() => {});
+}
+function rollDate() { if (S.shownToday && S.date !== todayStr()) { S.date = todayStr(); refreshView(); } } // left open overnight
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    if (auth.user && sync.pending()) sync.run({ pull: false, keepalive: true });
+    if (S.updateReady) reloadForUpdate();
+  } else {
+    rollDate();
+    if (auth.user && Date.now() - sync.lastPull > 15000) sync.run();
+  }
+});
+window.addEventListener('online', () => { if (auth.user) sync.run(); });
+setInterval(() => { if (auth.user && document.visibilityState === 'visible' && Date.now() - sync.lastPull > 170000) sync.run(); }, 60000);
+document.addEventListener('focusout', () => { if (refreshPending) setTimeout(() => { if (refreshPending) refreshView(); }, 250); });
+window.addEventListener('storage', e => { // another tab of the app changed something
+  if (!e.key || !e.key.startsWith('pl:')) return;
+  const k = e.key.slice(3);
+  if (k.startsWith('days/')) {
+    const d = k.slice(5);
+    if (e.newValue == null) { store.days.delete(d); delete S.days[d]; }
+    else { store.days.add(d); const cur = S.days[d]; if (cur) { try { const v = JSON.parse(e.newValue); for (const x of Object.keys(cur)) delete cur[x]; Object.assign(cur, v); cur.entries = cur.entries || []; cur.exercise = cur.exercise || []; } catch (er) { delete S.days[d]; } } }
+  } else if (k === 'auth') auth.load();
+  else if (/^(settings|foods|coach)\//.test(k)) reloadStateFromLocal();
+  else return;
+  clearTimeout(S.storageT); S.storageT = setTimeout(refreshView, 150);
+});
 (async () => {
-  reloadStateFromLocal();
-  cloud.init();
-  const recent = await store.recentDays(30); const lw = recent.find(d => d.weight); if (lw) S.lastWeight = lw.weight;
+  store.init(); auth.load(); reloadStateFromLocal();
+  const t = todayStr(); for (let i = 0; i < 30 && !S.lastWeight; i++) { const d = dayLocal(addDays(t, -i)); if (d && d.weight) S.lastWeight = d.weight; }
   let tab = 'today'; try { tab = localStorage.getItem('pl:tab') || 'today'; } catch (e) {}
+  const oauth = location.hash.includes('access_token=');
   if (await handleHealthUrl()) tab = 'today';
-  showTab(tab);
-  maybeAutoAdjust();
-  await loadFoods();
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+  showTab(tab); // the first screen comes straight from this device — no network, no SDK
+  setTimeout(async () => {
+    registerSW();
+    if (oauth) { if (await auth.handleOAuthReturn()) refreshView(); }
+    else if (!auth.user && !auth.checked) { try { await auth.migrateFromSdk(); } catch (e) {} auth.markChecked(); refreshView(); } // one-time carry-over of sign-ins from app versions ≤ 1.3
+    if (auth.user) sync.run();
+    maybeAutoAdjust();
+    setTimeout(loadFoods, 300);
+  }, 0);
 })();
+if (location.hostname === 'localhost' || window.__plTest) window.__pl = { S, store, sync, auth, DB, searchFoods, loadFoods, mergeDoc, mergeList, enc, dec, sameVal, compactEntry, loadDay, saveDay, dayLocal, downscale }; // test hook (never on the live site)
 })();

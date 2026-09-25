@@ -1,11 +1,11 @@
-"""Build data/cnf.json, data/usda.json and the app icons.
+"""Build data/cnf.json, data/usda.json, the app icons and self-hosted fonts, then stamp cache versions into sw.js/app.js.
 
 Runs in GitHub Actions on every push (see .github/workflows/pages.yml), so the
 repository only needs to hold the app source. Sources:
   - Canadian Nutrient File 2026 (Health Canada, open.canada.ca)
   - USDA SR28 (files mirrored in github.com/masilver99/SR28-PSQL)
 """
-import csv, io, json, os, urllib.request, zipfile
+import csv, glob, hashlib, io, json, os, re, urllib.request, zipfile
 
 OUT = 'data'
 os.makedirs(OUT, exist_ok=True)
@@ -82,6 +82,9 @@ def build_cnf():
         out.append([fid, name, grp, round(n['kcal']), g('p'), g('c'), g('f'), g('fib'), g('sug'), round(n.get('na', 0)), wt.get(fid, [])[:4], micro_row(n)])
     json.dump({'groups': groups, 'foods': out}, open(f'{OUT}/cnf.json', 'w'), separators=(',', ':'), ensure_ascii=False)
     print('CNF foods:', len(out))
+    for want in ('Milk, fluid, partly skimmed, 2%', 'Fish, salmon, atlantic, farmed', 'Egg, chicken, whole, raw'):  # spot-check micronutrients in the build log
+        hit = next((r for r in out if r[1].startswith(want)), None)
+        if hit: print('  sample', hit[1][:60], dict(zip(MICRO_ORDER, hit[11])))
 
 
 # ---------------- USDA SR28 ----------------
@@ -136,7 +139,50 @@ def build_icons():
     bg = Image.new('RGBA', (180, 180), (14, 124, 91, 255)); bg.alpha_composite(icon(180)); bg.convert('RGB').save('icons/apple-touch-icon.png')
 
 
+# ---------------- Fonts (self-hosted so the first screen never waits on fonts.googleapis.com) ----------------
+FONTS_CSS = 'https://fonts.googleapis.com/css2?family=Manrope:wght@500..800&family=Public+Sans:wght@400..600&display=swap'
+def build_fonts():
+    os.makedirs('fonts', exist_ok=True)
+    try:
+        req = urllib.request.Request(FONTS_CSS, headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'})
+        css = urllib.request.urlopen(req, timeout=60).read().decode('utf-8')
+        out, files = [], {}
+        for subset, block in re.findall(r'/\*\s*([\w-]+)\s*\*/\s*(@font-face\s*{[^}]*})', css):
+            if subset not in ('latin', 'latin-ext'): continue
+            url = re.search(r'url\((https://[^)]+\.woff2)\)', block).group(1)
+            fam = re.search(r"font-family:\s*'([^']+)'", block).group(1).replace(' ', '')
+            if url not in files:
+                name = f'{fam}-{subset}-{hashlib.sha256(url.encode()).hexdigest()[:8]}.woff2'
+                open('fonts/' + name, 'wb').write(fetch(url)); files[url] = name
+            out.append(f'/* {subset} */\n' + block.replace(url, files[url]))
+        if not out: raise RuntimeError('no latin @font-face blocks found')
+        open('fonts/fonts.css', 'w').write('\n'.join(out) + '\n')
+        print('Fonts:', sorted(files.values()))
+    except Exception as e:  # fall back to system fonts rather than failing the deploy
+        print('fonts skipped:', e)
+        open('fonts/fonts.css', 'w').write('/* self-hosted fonts unavailable at build time: system fonts */\n')
+        for f in glob.glob('fonts/*.woff2'): os.remove(f)
+
+
+# ---------------- Cache versions ----------------
+def stamp():
+    def digest(paths):
+        h = hashlib.sha256()
+        for p in paths: h.update(p.encode()); h.update(open(p, 'rb').read())
+        return h.hexdigest()[:12]
+    fonts = sorted(glob.glob('fonts/*.woff2'))
+    shell = digest(['index.html', 'app.js', 'manifest.json', 'sw.js', 'fonts/fonts.css', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'] + fonts)
+    data = digest(['data/cnf.json', 'data/usda.json'])
+    sw = open('sw.js').read().replace('__SHELL__', shell).replace('__DATA__', data).replace('/*__FONTS__*/', ', '.join("'./%s'" % f for f in fonts))
+    open('sw.js', 'w').write(sw)
+    app = open('app.js').read().replace('__BUILD__', shell)  # read first: open(..., 'w') truncates
+    open('app.js', 'w').write(app)
+    print('Stamped shell', shell, 'data', data, 'fonts', len(fonts))
+
+
 if __name__ == '__main__':
     build_cnf()
     build_usda()
     build_icons()
+    build_fonts()
+    stamp()

@@ -1,47 +1,46 @@
 # Plate Ledger
 
-Personal calorie & macro tracker. Runs entirely in the browser: the food database
-(Canadian Nutrient File 2026 + USDA SR28) ships with the app, the diary is stored on
-the device, and photo / text estimates call the Anthropic API directly with your own key.
+Personal calorie & macro tracker: https://mvb1610.github.io/plate-ledger/
 
-## Put it online with GitHub Pages (once, ~10 minutes)
+- **Food database**: Canadian Nutrient File 2026 + USDA SR28 (≈14,300 foods with vitamins & minerals), built into the app.
+- **Diary**: kept on the device for speed and offline use, and synced to the signed-in Google account (Firebase, private per user).
+- **Claude**: photo / text estimates, meal suggestions and the weekly review call the Anthropic API directly with the user's own key.
 
-1. Create a free account at github.com if you don't have one.
-2. Click **New repository**, name it `plate-ledger`, keep it **Public**
-   (Pages is free only for public repos), click **Create repository**.
-3. On the new repo page click **uploading an existing file**, drag ALL the files and
-   folders from this `plate-ledger-app` folder onto the page (index.html, app.js, sw.js,
-   manifest.json, README.md, .nojekyll, the `data` folder and the `icons` folder),
-   then click **Commit changes**.
-   - If the browser upload refuses the folders, use GitHub Desktop or, in Terminal:
-     ```
-     cd "path/to/plate-ledger-app"
-     git init && git add -A && git commit -m "Plate Ledger"
-     git branch -M main
-     git remote add origin https://github.com/YOUR-USER/plate-ledger.git
-     git push -u origin main
-     ```
-4. In the repo: **Settings → Pages → Build and deployment → Source: Deploy from a branch**,
-   Branch: `main`, folder `/ (root)`, **Save**.
-5. After a minute the page shows your link: `https://YOUR-USER.github.io/plate-ledger/`
+## How it's put together
 
-## On each phone
+| File | What it does |
+| --- | --- |
+| `index.html` | Layout and styles. No third-party scripts or stylesheets. |
+| `app.js` | The whole app (vanilla JS, no framework, no Firebase SDK). |
+| `sw.js` | Service worker: app shell and food data cached for offline use. Cache names are stamped with content hashes at build time. |
+| `build_data.py` | Runs in GitHub Actions on every push: builds `data/cnf.json` + `data/usda.json`, the icons and self-hosted fonts, then stamps the cache versions. |
+| `.github/workflows/pages.yml` | Build + deploy to GitHub Pages. |
 
-1. Open the link in Safari (iPhone) or Chrome (Android).
-2. **Settings** tab → paste an Anthropic API key (console.anthropic.com → API keys;
-   add a few dollars of credit) → **Save & test**.
-3. Share button → **Add to Home Screen**. Opens full-screen, camera works, works offline
-   for search and logging (estimates need internet).
+### Sync (since 1.4)
 
-Each phone keeps its own diary. Use **Settings → Backup (JSON)** now and then; the backup
-never includes the API key.
+Sign-in uses Google OAuth → Firebase Auth REST; sync uses the Firestore REST API directly
+(`users/{uid}/days/{date}` and `users/{uid}/meta/*`, readable/writable only by that user).
+
+- The first screen always comes from the device; nothing waits on the network.
+- Edits are saved locally and queued; uploads are batched and survive closing the app.
+- Pulls are incremental (documents changed since the last server read time, via a `_u` server timestamp),
+  with a full check once a week.
+- Every upload carries the version it was based on (`updateTime` precondition). If another device got there
+  first, the app pulls, does a three-way merge (per food entry / per setting) and retries — nothing is overwritten.
+- If the phone runs out of browser storage, the oldest days that are safely in the cloud are dropped locally and
+  fetched again when opened.
 
 ## Updating the app
 
-Replace the changed files in the repo (usually `app.js` and `index.html`) and bump the
-`CACHE` name in `sw.js` so phones pick up the new version on next open.
+Commit changed files to `main`. The Pages workflow rebuilds everything and stamps new cache versions, so phones pick
+up the update on their next launch automatically (no manual version bumps). The food data is only re-downloaded by
+phones when the data itself changes.
+
+## On a new phone
+
+Open the link in Safari → Share → **Add to Home Screen** → open it → **Settings → Sign in with Google**.
+Photo estimates need an Anthropic API key (Settings → Claude); it's saved to the account so it follows you to other devices.
 
 ## Cost
 
-A photo estimate with Claude Sonnet is roughly 1–3 ¢; Haiku is about a third of that.
-Search, logging, trends and export are free and offline.
+A photo estimate with Claude Sonnet is roughly 1–2 ¢; Haiku is about a third of that. Everything else is free.
